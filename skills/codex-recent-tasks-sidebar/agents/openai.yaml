@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex 最近任务栏"
+  short_description: "构建可吸附、可置顶并按文件夹显示最近任务的 macOS 小工具"
+  default_prompt: "使用 $codex-recent-tasks-sidebar 在这台 Mac 上构建并验收 Codex 最近任务栏。"

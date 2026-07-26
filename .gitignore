@@ -1,0 +1,12 @@
+.DS_Store
+build/
+DerivedData/
+*.app
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.log
+*.xcuserstate
+__pycache__/
+*.pyc
