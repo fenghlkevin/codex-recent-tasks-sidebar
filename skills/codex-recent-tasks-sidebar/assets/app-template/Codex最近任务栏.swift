@@ -442,6 +442,29 @@ struct TaskGroup: Identifiable {
     }
 }
 
+enum ProjectActions {
+    static func copyPath(_ path: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(path, forType: .string)
+    }
+
+    static func revealInFinder(_ path: String) {
+        let url = URL(fileURLWithPath: path, isDirectory: true)
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    static func openInTerminal(_ path: String) {
+        let url = URL(fileURLWithPath: path, isDirectory: true)
+        if let terminalURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") {
+            let configuration = NSWorkspace.OpenConfiguration()
+            NSWorkspace.shared.open([url], withApplicationAt: terminalURL, configuration: configuration)
+        } else {
+            NSWorkspace.shared.open(url)
+        }
+    }
+}
+
 enum RecentTaskPolicy {
     static let windowHours: Int64 = 48
     static let windowMillis = windowHours * 60 * 60 * 1000
@@ -770,6 +793,31 @@ enum DockPlacement {
         screens.max { lhs, rhs in
             lhs.frame.intersection(codexFrame).area < rhs.frame.intersection(codexFrame).area
         }
+    }
+}
+
+enum WindowWidthPreset: Int, CaseIterable {
+    case narrow = 320
+    case medium = 380
+    case wide = 500
+
+    static let storageKey = "CodexRecentTasksWindowWidthPreset"
+
+    var title: String {
+        switch self {
+        case .narrow: return "窄"
+        case .medium: return "中"
+        case .wide: return "宽"
+        }
+    }
+
+    static var saved: WindowWidthPreset {
+        let rawValue = UserDefaults.standard.integer(forKey: storageKey)
+        return WindowWidthPreset(rawValue: rawValue) ?? .medium
+    }
+
+    func save() {
+        UserDefaults.standard.set(rawValue, forKey: Self.storageKey)
     }
 }
 
@@ -1424,6 +1472,25 @@ struct RecentTaskRowView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .contextMenu {
+            Button {
+                ProjectActions.copyPath(task.canonicalProjectPath)
+            } label: {
+                Label("复制项目路径", systemImage: "doc.on.doc")
+            }
+
+            Button {
+                ProjectActions.revealInFinder(task.canonicalProjectPath)
+            } label: {
+                Label("在 Finder 打开项目", systemImage: "folder")
+            }
+
+            Button {
+                ProjectActions.openInTerminal(task.canonicalProjectPath)
+            } label: {
+                Label("在终端打开项目", systemImage: "terminal")
+            }
+        }
         .onHover { isHovering = $0 }
         .help("\(projectName)\n任务：\(task.title)\n状态：\(displayState.statusDescription)\n最近活动：\(TimeLabelFormatter.fullLabel(milliseconds: task.updatedMillis))\nThread ID：\(task.id)")
         .accessibilityLabel("\(projectName)，任务 \(task.title)，\(displayState.statusDescription)，最近活动 \(shortTime)")
@@ -1519,7 +1586,7 @@ struct TaskListView: View {
     private var header: some View {
         VStack(spacing: 9) {
             HStack(spacing: 10) {
-                Image(systemName: "clock.arrow.circlepath")
+                Image(systemName: "sidebar.left")
                     .font(.system(size: 17, weight: .semibold))
                     .foregroundStyle(Color.accentColor)
 
@@ -1880,8 +1947,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func createPanel() {
+        let widthPreset = WindowWidthPreset.saved
         let panel = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 360, height: 680),
+            contentRect: NSRect(x: 0, y: 0, width: CGFloat(widthPreset.rawValue), height: 680),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -1909,6 +1977,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         self.panel = panel
+        applyWindowWidthPreset(widthPreset, persist: false)
     }
 
     private func applyWindowMode(_ mode: WindowDisplayMode) {
@@ -2151,10 +2220,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    private func applyWindowWidthPreset(_ preset: WindowWidthPreset, persist: Bool = true) {
+        guard let panel else { return }
+        if persist {
+            preset.save()
+        }
+
+        var frame = panel.frame
+        let width = min(max(CGFloat(preset.rawValue), panel.minSize.width), panel.maxSize.width)
+        frame.size.width = width
+        panel.setFrame(frame, display: true)
+        if windowMode.mode == .docked {
+            dockToCodexWindow()
+        }
+    }
+
     private func createStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = item.button {
-            button.image = NSImage(systemSymbolName: "clock.arrow.circlepath", accessibilityDescription: "Codex 最近任务")
+            button.image = NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: "Codex 最近任务")
             button.toolTip = "Codex 最近任务"
         }
 
@@ -2162,6 +2246,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(NSMenuItem(title: "显示任务栏", action: #selector(showPanel), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "刷新任务与用量", action: #selector(refreshTasks), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "请求辅助功能权限", action: #selector(requestAccessibilityPermission), keyEquivalent: ""))
+        menu.addItem(.separator())
+
+        let widthMenu = NSMenu()
+        for preset in WindowWidthPreset.allCases {
+            let item = NSMenuItem(title: preset.title, action: #selector(selectWindowWidthPreset(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = preset.rawValue
+            item.state = preset == WindowWidthPreset.saved ? .on : .off
+            widthMenu.addItem(item)
+        }
+        let widthItem = NSMenuItem(title: "窗口宽度", action: nil, keyEquivalent: "")
+        widthItem.submenu = widthMenu
+        menu.addItem(widthItem)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q"))
         menu.items.forEach { $0.target = self }
@@ -2182,6 +2279,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func requestAccessibilityPermission() {
         CodexWindowLocator.requestAccessibilityPermission()
+    }
+
+    @objc private func selectWindowWidthPreset(_ sender: NSMenuItem) {
+        guard let preset = WindowWidthPreset(rawValue: sender.tag) else { return }
+        applyWindowWidthPreset(preset)
+        sender.menu?.items.forEach { item in
+            item.state = item.tag == preset.rawValue ? .on : .off
+        }
     }
 
     @objc private func refreshTasks() {
