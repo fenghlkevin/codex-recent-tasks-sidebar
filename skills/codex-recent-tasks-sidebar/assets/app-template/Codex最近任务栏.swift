@@ -187,6 +187,76 @@ private struct ThreadNameRecord: Decodable {
     }
 }
 
+enum DiagnosticLogger {
+    static let logURL: URL = {
+        let baseURL = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return baseURL
+            .appendingPathComponent("CodexRecentTasksSidebar", isDirectory: true)
+            .appendingPathComponent("diagnostics.log")
+    }()
+
+    private static let queue = DispatchQueue(label: "io.github.codexrecenttasks.diagnostics")
+    private static let maximumLogSize = 256 * 1024
+    private static let timestampFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    static func log(_ message: String) {
+        queue.async {
+            let timestamp = timestampFormatter.string(from: Date())
+            let line = "\(timestamp) \(message)\n"
+            let directoryURL = logURL.deletingLastPathComponent()
+
+            do {
+                try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+                trimIfNeeded()
+                if let data = line.data(using: .utf8) {
+                    if FileManager.default.fileExists(atPath: logURL.path),
+                       let handle = try? FileHandle(forWritingTo: logURL) {
+                        try handle.seekToEnd()
+                        try handle.write(contentsOf: data)
+                        try handle.close()
+                    } else {
+                        try data.write(to: logURL, options: .atomic)
+                    }
+                }
+            } catch {
+                // Diagnostics are best-effort only.
+            }
+        }
+    }
+
+    static func copyLogPath() {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(logURL.path, forType: .string)
+    }
+
+    static func abbreviatedPath(_ path: String) -> String {
+        let homePath = FileManager.default.homeDirectoryForCurrentUser.path
+        if path == homePath { return "~" }
+        if path.hasPrefix(homePath + "/") {
+            return "~" + path.dropFirst(homePath.count)
+        }
+        return path
+    }
+
+    private static func trimIfNeeded() {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: logURL.path),
+              let size = attributes[.size] as? NSNumber,
+              size.intValue > maximumLogSize else {
+            return
+        }
+
+        guard let data = try? Data(contentsOf: logURL) else { return }
+        let suffix = data.suffix(maximumLogSize / 2)
+        try? Data(suffix).write(to: logURL, options: .atomic)
+    }
+}
+
 private enum UnreadTaskStateRepository {
     private static let persistedAtomsKey = "electron-persisted-atom-state"
     private static let unreadThreadsKey = "unread-thread-ids-by-host-v1"
@@ -509,6 +579,14 @@ enum TaskRepositoryError: LocalizedError {
             return "任务数据格式异常：\(message)"
         }
     }
+
+    var isTransientDatabaseOpenError: Bool {
+        guard case let .sqliteFailed(message) = self else { return false }
+        let lowercasedMessage = message.lowercased()
+        return lowercasedMessage.contains("unable to open database file")
+            || lowercasedMessage.contains("database is locked")
+            || lowercasedMessage.contains("disk i/o error")
+    }
 }
 
 struct TaskRepository {
@@ -533,7 +611,52 @@ struct TaskRepository {
     """
 
     static func loadTasks() throws -> (databaseURL: URL, tasks: [CodexTask]) {
-        let databaseURL = try currentDatabaseURL()
+        let databaseURLs = try currentDatabaseURLs()
+        DiagnosticLogger.log(
+            "TaskRepository.loadTasks candidates=\(databaseURLs.map { DiagnosticLogger.abbreviatedPath($0.path) }.joined(separator: ","))"
+        )
+        var lastError: Error?
+
+        for databaseURL in databaseURLs {
+            do {
+                let result = try loadTasksWithFallback(from: databaseURL)
+                DiagnosticLogger.log(
+                    "TaskRepository.loadTasks success database=\(DiagnosticLogger.abbreviatedPath(databaseURL.path)) taskCount=\(result.tasks.count)"
+                )
+                return result
+            } catch {
+                lastError = error
+                DiagnosticLogger.log(
+                    "TaskRepository.loadTasks failed database=\(DiagnosticLogger.abbreviatedPath(databaseURL.path)) error=\(error.localizedDescription)"
+                )
+                guard let repositoryError = error as? TaskRepositoryError,
+                      repositoryError.isTransientDatabaseOpenError else {
+                    throw error
+                }
+            }
+        }
+
+        throw lastError ?? TaskRepositoryError.databaseNotFound
+    }
+
+    private static func loadTasksWithFallback(from databaseURL: URL) throws -> (databaseURL: URL, tasks: [CodexTask]) {
+        do {
+            return try loadTasks(from: databaseURL, databaseArgument: databaseURL.path, mode: "readonly")
+        } catch {
+            guard let repositoryError = error as? TaskRepositoryError,
+                  repositoryError.isTransientDatabaseOpenError else {
+                throw error
+            }
+
+            let immutableArgument = "\(databaseURL.absoluteString)?mode=ro&immutable=1"
+            DiagnosticLogger.log(
+                "TaskRepository.loadTasks immutableFallback database=\(DiagnosticLogger.abbreviatedPath(databaseURL.path)) reason=\(error.localizedDescription)"
+            )
+            return try loadTasks(from: databaseURL, databaseArgument: immutableArgument, mode: "immutable")
+        }
+    }
+
+    private static func loadTasks(from databaseURL: URL, databaseArgument: String, mode: String) throws -> (databaseURL: URL, tasks: [CodexTask]) {
         let outputPipe = Pipe()
         let errorPipe = Pipe()
         let process = Process()
@@ -543,7 +666,7 @@ struct TaskRepository {
             "-readonly",
             "-json",
             "-cmd", ".timeout 800",
-            databaseURL.path,
+            databaseArgument,
             query,
         ]
         process.standardOutput = outputPipe
@@ -552,6 +675,9 @@ struct TaskRepository {
         do {
             try process.run()
         } catch {
+            DiagnosticLogger.log(
+                "sqlite3 run failed mode=\(mode) database=\(DiagnosticLogger.abbreviatedPath(databaseURL.path)) error=\(error.localizedDescription)"
+            )
             throw TaskRepositoryError.sqliteFailed(error.localizedDescription)
         }
 
@@ -562,6 +688,9 @@ struct TaskRepository {
         guard process.terminationStatus == 0 else {
             let rawMessage = String(data: errorData, encoding: .utf8) ?? "未知错误"
             let message = rawMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+            DiagnosticLogger.log(
+                "sqlite3 exit failed mode=\(mode) database=\(DiagnosticLogger.abbreviatedPath(databaseURL.path)) status=\(process.terminationStatus) stderr=\(message)"
+            )
             throw TaskRepositoryError.sqliteFailed(message.isEmpty ? "sqlite3 退出码 \(process.terminationStatus)" : message)
         }
 
@@ -587,6 +716,9 @@ struct TaskRepository {
             }
             return (databaseURL, tasks)
         } catch {
+            DiagnosticLogger.log(
+                "TaskRepository.decode failed mode=\(mode) database=\(DiagnosticLogger.abbreviatedPath(databaseURL.path)) bytes=\(data.count) error=\(error.localizedDescription)"
+            )
             throw TaskRepositoryError.invalidData(error.localizedDescription)
         }
     }
@@ -629,28 +761,38 @@ struct TaskRepository {
         return fileManager.fileExists(atPath: url.path) ? url : nil
     }
 
-    private static func currentDatabaseURL() throws -> URL {
+    private static func currentDatabaseURLs() throws -> [URL] {
         let fileManager = FileManager.default
         let environment = ProcessInfo.processInfo.environment
 
         if let override = environment["CODEX_TASK_DB_OVERRIDE"], !override.isEmpty {
             let url = URL(fileURLWithPath: override)
             guard fileManager.fileExists(atPath: url.path) else {
+                DiagnosticLogger.log("TaskRepository.database override missing path=\(DiagnosticLogger.abbreviatedPath(url.path))")
                 throw TaskRepositoryError.databaseNotFound
             }
-            return url
+            DiagnosticLogger.log("TaskRepository.database override path=\(DiagnosticLogger.abbreviatedPath(url.path))")
+            return [url]
         }
 
         let home = fileManager.homeDirectoryForCurrentUser
         let candidates = [
             home.appendingPathComponent(".codex/state_5.sqlite"),
             home.appendingPathComponent(".codex/sqlite/state_5.sqlite"),
-        ].filter { fileManager.fileExists(atPath: $0.path) }
+        ]
+            .filter { fileManager.fileExists(atPath: $0.path) }
+            .sorted { modificationDate(for: $0) > modificationDate(for: $1) }
 
-        guard let newest = candidates.max(by: { modificationDate(for: $0) < modificationDate(for: $1) }) else {
+        guard !candidates.isEmpty else {
+            DiagnosticLogger.log("TaskRepository.database candidates missing")
             throw TaskRepositoryError.databaseNotFound
         }
-        return newest
+        if candidates.count > 1 {
+            DiagnosticLogger.log(
+                "TaskRepository.database newestOnly selected=\(DiagnosticLogger.abbreviatedPath(candidates[0].path)) ignored=\(candidates.dropFirst().map { DiagnosticLogger.abbreviatedPath($0.path) }.joined(separator: ","))"
+            )
+        }
+        return [candidates[0]]
     }
 
     private static func modificationDate(for url: URL) -> Date {
@@ -967,6 +1109,8 @@ final class TaskStore: ObservableObject {
     private var refreshTimer: Timer?
     private var runtimeRefreshTimer: Timer?
     private var readAcknowledgements: [String: Int64] = [:]
+    private var pendingRefreshRetry: DispatchWorkItem?
+    private var transientRefreshFailureCount = 0
 
     init() {
         refresh()
@@ -985,6 +1129,7 @@ final class TaskStore: ObservableObject {
     deinit {
         refreshTimer?.invalidate()
         runtimeRefreshTimer?.invalidate()
+        pendingRefreshRetry?.cancel()
     }
 
     func refresh() {
@@ -998,9 +1143,62 @@ final class TaskStore: ObservableObject {
             databasePath = result.databaseURL.path
             errorMessage = nil
             lastRefresh = Date()
+            transientRefreshFailureCount = 0
+            pendingRefreshRetry?.cancel()
+            pendingRefreshRetry = nil
         } catch {
+            if scheduleTransientRetryIfNeeded(for: error) {
+                return
+            }
+            if let repositoryError = error as? TaskRepositoryError,
+               repositoryError.isTransientDatabaseOpenError,
+               !tasks.isEmpty {
+                DiagnosticLogger.log("TaskStore.refresh transientErrorSuppressed=\(error.localizedDescription)")
+                errorMessage = nil
+                return
+            }
+            DiagnosticLogger.log("TaskStore.refresh errorShown=\(error.localizedDescription)")
             errorMessage = error.localizedDescription
         }
+    }
+
+    private func scheduleTransientRetryIfNeeded(for error: Error) -> Bool {
+        guard let repositoryError = error as? TaskRepositoryError,
+              repositoryError.isTransientDatabaseOpenError,
+              transientRefreshFailureCount < 6 else {
+            return false
+        }
+
+        transientRefreshFailureCount += 1
+        pendingRefreshRetry?.cancel()
+        errorMessage = nil
+        DiagnosticLogger.log(
+            "TaskStore.refresh transientRetry attempt=\(transientRefreshFailureCount) error=\(error.localizedDescription)"
+        )
+
+        let delay: TimeInterval
+        switch transientRefreshFailureCount {
+        case 1:
+            delay = 0.6
+        case 2:
+            delay = 1.5
+        case 3:
+            delay = 3.0
+        case 4:
+            delay = 6.0
+        default:
+            delay = 10.0
+        }
+
+        let retry = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.pendingRefreshRetry = nil
+                self?.refresh()
+            }
+        }
+        pendingRefreshRetry = retry
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: retry)
+        return true
     }
 
     func refreshRuntimeStates() {
@@ -2246,6 +2444,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(NSMenuItem(title: "显示任务栏", action: #selector(showPanel), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "刷新任务与用量", action: #selector(refreshTasks), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "请求辅助功能权限", action: #selector(requestAccessibilityPermission), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "复制诊断日志路径", action: #selector(copyDiagnosticLogPath), keyEquivalent: ""))
         menu.addItem(.separator())
 
         let widthMenu = NSMenu()
@@ -2279,6 +2478,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func requestAccessibilityPermission() {
         CodexWindowLocator.requestAccessibilityPermission()
+    }
+
+    @objc private func copyDiagnosticLogPath() {
+        DiagnosticLogger.copyLogPath()
     }
 
     @objc private func selectWindowWidthPreset(_ sender: NSMenuItem) {
