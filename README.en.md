@@ -221,6 +221,10 @@ Confirm that ChatGPT / Codex is signed in and that a compatible official `codex 
 - Changes to the Codex database schema, unread-state format, `app-server` protocol, bundle identifier, or deep-link scheme may require an update.
 - Usage analytics depend on official data and can be delayed or temporarily unavailable.
 
+## Origin and credits
+
+The original version of this project came from [chuanfan-ai/codex-recent-tasks-sidebar-skill](https://github.com/chuanfan-ai/codex-recent-tasks-sidebar-skill.git). Thanks to the original author for the foundational implementation and open-source template.
+
 ## License
 
 [MIT](LICENSE)

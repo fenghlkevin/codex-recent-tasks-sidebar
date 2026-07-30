@@ -221,6 +221,10 @@ QA 不读取真实任务内容，也不会连接真实账号。
 - Codex 更改数据库结构、未读状态、`app-server` 协议、Bundle ID 或深链协议后，应用可能需要适配。
 - 用量统计依赖官方返回的数据，可能延迟或暂时缺失。
 
+## 来源与致谢
+
+本项目的原始版本来自 [chuanfan-ai/codex-recent-tasks-sidebar-skill](https://github.com/chuanfan-ai/codex-recent-tasks-sidebar-skill.git)。感谢原作者提供基础实现和开源模板。
+
 ## License
 
 [MIT](LICENSE)
