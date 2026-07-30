@@ -2064,31 +2064,19 @@ struct TaskListView: View {
             }
 
             HStack(spacing: 8) {
-                windowModeButton(
-                    title: "吸附 Codex",
-                    icon: "rectangle.leadinghalf.inset.filled",
-                    mode: .docked
-                )
-                windowModeButton(
-                    title: "单独置顶",
-                    icon: "pin.fill",
-                    mode: .pinned
-                )
-            }
+                windowModeSelector
+                    .frame(maxWidth: .infinity)
 
-            if windowMode.mode == .docked {
-                HStack(spacing: 7) {
-                    Text("吸附位置")
-                        .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(.tertiary)
-
-                    dockSideButton(title: "左侧", icon: "rectangle.lefthalf.inset.filled", side: .left)
-                    dockSideButton(title: "右侧", icon: "rectangle.righthalf.inset.filled", side: .right)
-
-                    Text("也可拖标题换侧")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
+                Group {
+                    if windowMode.mode == .docked {
+                        dockSideSelector
+                    } else {
+                        Color.clear
+                            .accessibilityHidden(true)
+                    }
                 }
+                .frame(maxWidth: .infinity)
+                .frame(height: 28)
             }
         }
         .padding(.horizontal, 14)
@@ -2274,8 +2262,8 @@ struct TaskListView: View {
                 Spacer()
                 if case let .available(snapshot) = usageStore.state {
                     Text(accountSummary(snapshot))
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(.primary)
                         .lineLimit(1)
                 }
                 Image(systemName: "chevron.down")
@@ -2592,7 +2580,42 @@ struct TaskListView: View {
         return "官方每日数据截至 \(String(dateKey.suffix(5)))；\(estimateNote)"
     }
 
-    private func windowModeButton(title: String, icon: String, mode: WindowDisplayMode) -> some View {
+    private var windowModeSelector: some View {
+        HStack(spacing: 0) {
+            windowModeSegment(title: "吸附", icon: "rectangle.leadinghalf.inset.filled", mode: .docked)
+            selectorDivider
+            windowModeSegment(title: "置顶", icon: "pin.fill", mode: .pinned)
+        }
+        .frame(height: 28)
+        .background(Color.primary.opacity(0.045))
+        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .overlay(selectorBorder)
+    }
+
+    private var dockSideSelector: some View {
+        HStack(spacing: 0) {
+            dockSideSegment(title: "左侧", icon: "rectangle.lefthalf.inset.filled", side: .left)
+            selectorDivider
+            dockSideSegment(title: "右侧", icon: "rectangle.righthalf.inset.filled", side: .right)
+        }
+        .frame(height: 28)
+        .background(Color.primary.opacity(0.045))
+        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .overlay(selectorBorder)
+    }
+
+    private var selectorDivider: some View {
+        Rectangle()
+            .fill(Color.primary.opacity(0.08))
+            .frame(width: 1, height: 16)
+    }
+
+    private var selectorBorder: some View {
+        RoundedRectangle(cornerRadius: 7, style: .continuous)
+            .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+    }
+
+    private func windowModeSegment(title: String, icon: String, mode: WindowDisplayMode) -> some View {
         let isSelected = windowMode.mode == mode
         return Button {
             windowMode.select(mode)
@@ -2606,37 +2629,27 @@ struct TaskListView: View {
             .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
             .frame(maxWidth: .infinity)
             .frame(height: 28)
-            .background(
-                isSelected ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.045),
-                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .stroke(isSelected ? Color.accentColor.opacity(0.24) : Color.clear, lineWidth: 1)
-            )
+            .background(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(title)
+        .accessibilityLabel(mode == .docked ? "吸附 Codex" : "单独置顶")
     }
 
-    private func dockSideButton(title: String, icon: String, side: DockSide) -> some View {
+    private func dockSideSegment(title: String, icon: String, side: DockSide) -> some View {
         let isSelected = windowMode.dockSide == side
         return Button {
             windowMode.selectDockSide(side)
         } label: {
-            HStack(spacing: 4) {
+            HStack(spacing: 6) {
                 Image(systemName: icon)
-                    .font(.system(size: 9.5, weight: .semibold))
+                    .font(.system(size: 11.5, weight: .semibold))
                 Text(title)
-                    .font(.system(size: 10.5, weight: .semibold))
+                    .font(.system(size: 11.5, weight: .semibold))
             }
             .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
-            .padding(.horizontal, 8)
-            .frame(height: 23)
-            .background(
-                isSelected ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.04),
-                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
-            )
+            .frame(maxWidth: .infinity)
+            .frame(height: 28)
+            .background(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
         }
         .buttonStyle(.plain)
         .accessibilityLabel("吸附到 Codex \(title)")
@@ -2768,8 +2781,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         createPanel()
         createStatusItem()
+
+        guard CodexWindowLocator.isCodexRunning() else {
+            terminateBecauseCodexExited()
+            return
+        }
+
         applyWindowMode(.docked)
-        showPanel()
+        if CodexWindowLocator.largestWindowFrame() != nil {
+            showPanel()
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
