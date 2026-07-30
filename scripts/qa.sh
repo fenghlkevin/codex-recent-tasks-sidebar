@@ -47,6 +47,12 @@ INSERT INTO threads VALUES
   ('00000000-0000-0000-0000-000000000005', 'Excluded child task', '/tmp/example-project-a', '', 4102444400000, 4102444400, 0, 'subagent', '', '', '');
 INSERT INTO thread_spawn_edges VALUES
   ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000005', 'running');
+ALTER TABLE threads ADD COLUMN model TEXT;
+ALTER TABLE threads ADD COLUMN tokens_used INTEGER NOT NULL DEFAULT 0;
+UPDATE threads SET model='gpt-5.5', tokens_used=12000000
+WHERE id='00000000-0000-0000-0000-000000000001';
+UPDATE threads SET model='gpt-5.4-mini', tokens_used=3000000
+WHERE id='00000000-0000-0000-0000-000000000002';
 SQL
 
 cat > "$FIXTURE_INDEX" <<'JSONL'
@@ -90,13 +96,18 @@ JSONL
 
 cat > "$FIXTURE_USAGE_SERVER" <<'ZSH'
 #!/bin/zsh
-request_count=0
 while IFS= read -r line; do
-  (( request_count += 1 ))
-  if (( request_count == 1 )); then
+  request_id="${line#*\"id\":}"
+  request_id="${request_id%%,*}"
+  request_id="${request_id%%\}*}"
+  if [[ "$line" == *'"method":"initialize"'* ]]; then
     print '{"id":1,"result":{"serverInfo":{"name":"fake-codex","version":"1"}}}'
-  elif (( request_count >= 2 )); then
-    print '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":35,"windowDurationMins":300},"secondary":{"usedPercent":90,"windowDurationMins":10080}}}}'
+  elif [[ "$line" == *'account'*'rateLimits'*'read'* ]]; then
+    print "{\"id\":$request_id,\"result\":{\"rateLimits\":{\"limitId\":\"codex\",\"planType\":\"prolite\",\"primary\":{\"usedPercent\":35,\"windowDurationMins\":300,\"resetsAt\":4102444800},\"secondary\":{\"usedPercent\":90,\"windowDurationMins\":10080,\"resetsAt\":4102704000}},\"rateLimitResetCredits\":{\"availableCount\":1,\"credits\":[{\"expiresAt\":4102444800}]}}}"
+  elif [[ "$line" == *'account'*'read'* && "$line" != *'usage'* && "$line" != *'rateLimits'* ]]; then
+    print "{\"id\":$request_id,\"result\":{\"account\":{\"type\":\"chatgpt\",\"planType\":\"prolite\"},\"requiresOpenaiAuth\":true}}"
+  elif [[ "$line" == *'account'*'usage'*'read'* ]]; then
+    print "{\"id\":$request_id,\"result\":{\"summary\":{\"lifetimeTokens\":27000000},\"dailyUsageBuckets\":[{\"startDate\":\"2099-12-31\",\"tokens\":12000000},{\"startDate\":\"2100-01-01\",\"tokens\":15000000}]}}"
   fi
 done
 ZSH
@@ -132,9 +143,10 @@ after_action_rollout_hash="$(/usr/bin/shasum "$FIXTURE_ACTION_ROLLOUT")"
 
 usage_test_output="$(
   CODEX_APP_SERVER_OVERRIDE="$FIXTURE_USAGE_SERVER" \
+  CODEX_TASK_DB_OVERRIDE="$FIXTURE_DB" \
   "$BINARY" --usage-self-test
 )"
-[[ "$usage_test_output" == "USAGE_SELF_TEST_OK windows=2" ]] || {
+[[ "$usage_test_output" == "USAGE_SELF_TEST_OK windows=2 analytics=ok" ]] || {
   print -u2 "Codex 用量协议自检失败：$usage_test_output"
   exit 9
 }

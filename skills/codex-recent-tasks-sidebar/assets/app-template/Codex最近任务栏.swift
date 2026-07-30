@@ -795,6 +795,10 @@ struct TaskRepository {
         return [candidates[0]]
     }
 
+    static func currentDatabaseURLForUsageAnalytics() throws -> URL {
+        try currentDatabaseURLs()[0]
+    }
+
     private static func modificationDate(for url: URL) -> Date {
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
         return attributes?[.modificationDate] as? Date ?? .distantPast
@@ -1106,6 +1110,8 @@ final class TaskStore: ObservableObject {
     @Published private(set) var lastRefresh: Date?
     @Published private(set) var now = Date()
 
+    typealias RefreshCompletion = () -> Void
+
     private var refreshTimer: Timer?
     private var runtimeRefreshTimer: Timer?
     private var readAcknowledgements: [String: Int64] = [:]
@@ -1132,7 +1138,8 @@ final class TaskStore: ObservableObject {
         pendingRefreshRetry?.cancel()
     }
 
-    func refresh() {
+    func refresh(completion: RefreshCompletion? = nil) {
+        defer { completion?() }
         now = Date()
         do {
             let result = try TaskRepository.loadTasks()
@@ -1275,13 +1282,37 @@ final class TaskStore: ObservableObject {
 struct UsageWindowDisplay: Identifiable, Equatable {
     let label: String
     let remainingPercent: Int
+    let durationMinutes: Int?
+    let resetsAt: Date?
 
     var id: String { label }
 }
 
+struct UsageDailyBucket: Identifiable, Equatable {
+    let dateKey: String
+    let tokens: Int64
+
+    var id: String { dateKey }
+}
+
+struct LocalUsageEstimate: Equatable {
+    let mostUsedModel: String?
+    let inputPricePerMillionTokens: Double?
+}
+
+struct UsageSnapshot: Equatable {
+    let windows: [UsageWindowDisplay]
+    let planType: String?
+    let resetCreditCount: Int?
+    let resetCreditExpiresAt: Date?
+    let dailyBuckets: [UsageDailyBucket]
+    let localEstimate: LocalUsageEstimate
+    let refreshedAt: Date
+}
+
 enum UsageState: Equatable {
     case loading
-    case available([UsageWindowDisplay])
+    case available(UsageSnapshot)
     case unavailable(String)
 }
 
@@ -1306,7 +1337,9 @@ enum CodexUsageError: LocalizedError {
 }
 
 enum UsageSnapshotParser {
-    static func windows(from result: [String: Any]) throws -> [UsageWindowDisplay] {
+    static func rateLimitDetails(
+        from result: [String: Any]
+    ) throws -> (windows: [UsageWindowDisplay], resetCreditCount: Int?, resetCreditExpiresAt: Date?) {
         guard let rateLimits = result["rateLimits"] as? [String: Any] else {
             throw CodexUsageError.protocolFailed("缺少 rateLimits")
         }
@@ -1322,16 +1355,62 @@ enum UsageSnapshotParser {
             }
             let usedPercent = min(max(usedNumber.intValue, 0), 100)
             let duration = (rawWindow["windowDurationMins"] as? NSNumber)?.intValue
+            let resetTimestamp = (rawWindow["resetsAt"] as? NSNumber)?.doubleValue
             return UsageWindowDisplay(
                 label: durationLabel(minutes: duration, fallback: candidate.fallback),
-                remainingPercent: 100 - usedPercent
+                remainingPercent: 100 - usedPercent,
+                durationMinutes: duration,
+                resetsAt: resetTimestamp.flatMap {
+                    $0 > 0 ? Date(timeIntervalSince1970: $0) : nil
+                }
             )
+        }
+        .sorted {
+            ($0.durationMinutes ?? Int.max, $0.label)
+                < ($1.durationMinutes ?? Int.max, $1.label)
         }
 
         guard !windows.isEmpty else {
             throw CodexUsageError.protocolFailed("没有可显示的用量周期")
         }
-        return windows
+
+        let resetCredits = result["rateLimitResetCredits"] as? [String: Any]
+        let resetCreditCount = (resetCredits?["availableCount"] as? NSNumber)?.intValue
+        let creditRows = resetCredits?["credits"] as? [[String: Any]]
+        let expirationDates = creditRows?
+            .compactMap { ($0["expiresAt"] as? NSNumber)?.doubleValue }
+            .filter { $0 > 0 }
+            .map { Date(timeIntervalSince1970: $0) } ?? []
+
+        return (windows, resetCreditCount, expirationDates.min())
+    }
+
+    static func windows(from result: [String: Any]) throws -> [UsageWindowDisplay] {
+        try rateLimitDetails(from: result).windows
+    }
+
+    static func planType(from result: [String: Any]) -> String? {
+        let account = result["account"] as? [String: Any]
+        let rateLimits = result["rateLimits"] as? [String: Any]
+        guard let planType = (account?["planType"] as? String)
+            ?? (rateLimits?["planType"] as? String) else { return nil }
+        let trimmed = planType.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    static func dailyBuckets(from result: [String: Any]) -> [UsageDailyBucket] {
+        guard let rawBuckets = result["dailyUsageBuckets"] as? [[String: Any]] else {
+            return []
+        }
+        return rawBuckets.compactMap { bucket in
+            guard let dateKey = bucket["startDate"] as? String,
+                  dateKey.count == 10,
+                  let tokens = bucket["tokens"] as? NSNumber else {
+                return nil
+            }
+            return UsageDailyBucket(dateKey: dateKey, tokens: max(0, tokens.int64Value))
+        }
+        .sorted { $0.dateKey < $1.dateKey }
     }
 
     private static func durationLabel(minutes: Int?, fallback: String) -> String {
@@ -1343,8 +1422,86 @@ enum UsageSnapshotParser {
     }
 }
 
+enum LocalUsageEstimator {
+    private struct ModelRow: Decodable {
+        let model: String
+        let tokens: Int64
+    }
+
+    private static let query = """
+    SELECT
+      trim(model) AS model,
+      CAST(SUM(tokens_used) AS INTEGER) AS tokens
+    FROM threads
+    WHERE archived = 0
+      AND trim(COALESCE(model, '')) <> ''
+      AND COALESCE(tokens_used, 0) > 0
+      AND CAST(COALESCE(NULLIF(updated_at_ms, 0), updated_at * 1000) AS INTEGER)
+          >= CAST(strftime('%s', 'now', '-30 days') AS INTEGER) * 1000
+    GROUP BY trim(model)
+    ORDER BY tokens DESC, model ASC
+    LIMIT 1;
+    """
+
+    static func load() -> LocalUsageEstimate {
+        do {
+            let databaseURL = try TaskRepository.currentDatabaseURLForUsageAnalytics()
+            let outputPipe = Pipe()
+            let errorPipe = Pipe()
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+            process.arguments = [
+                "-readonly",
+                "-json",
+                "-cmd", ".timeout 800",
+                databaseURL.path,
+                query,
+            ]
+            process.standardOutput = outputPipe
+            process.standardError = errorPipe
+            try process.run()
+            let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+            _ = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0,
+                  let row = try JSONDecoder().decode([ModelRow].self, from: data).first else {
+                return LocalUsageEstimate(mostUsedModel: nil, inputPricePerMillionTokens: nil)
+            }
+            return LocalUsageEstimate(
+                mostUsedModel: row.model,
+                inputPricePerMillionTokens: inputPricePerMillionTokens(for: row.model)
+            )
+        } catch {
+            return LocalUsageEstimate(mostUsedModel: nil, inputPricePerMillionTokens: nil)
+        }
+    }
+
+    private static func inputPricePerMillionTokens(for rawModel: String) -> Double? {
+        let model = rawModel.lowercased()
+        if model.contains("gpt-5.6-luna") { return 1.0 }
+        if model.contains("gpt-5.6-terra") { return 2.5 }
+        if model.contains("gpt-5.6-sol") || model == "gpt-5.6" { return 5.0 }
+        if model.contains("gpt-5.5-pro") { return 30.0 }
+        if model.contains("gpt-5.5") { return 5.0 }
+        if model.contains("gpt-5.4-mini") { return 0.75 }
+        if model.contains("gpt-5.4-nano") { return 0.20 }
+        if model.contains("gpt-5.4-pro") { return 30.0 }
+        if model.contains("gpt-5.4") { return 2.5 }
+        if model.contains("gpt-5.3-codex") || model.contains("gpt-5.2-codex") { return 1.75 }
+        if model.contains("gpt-5-codex") || model == "gpt-5" { return 1.25 }
+        if model.contains("gpt-5-mini") { return 0.25 }
+        return nil
+    }
+}
+
 final class CodexUsageClient {
-    typealias Completion = (Result<[UsageWindowDisplay], Error>) -> Void
+    typealias Completion = (Result<UsageSnapshot, Error>) -> Void
+
+    private enum RequestKind {
+        case rateLimits
+        case account
+        case usage
+    }
 
     private let queue = DispatchQueue(label: "io.github.codexrecenttasks.usage")
     private var process: Process?
@@ -1353,9 +1510,16 @@ final class CodexUsageClient {
     private var readBuffer = Data()
     private var initialized = false
     private var isStopping = false
-    private var currentRequestID: Int?
     private var nextRequestID = 2
+    private var pendingRequests: [Int: RequestKind] = [:]
     private var pendingCompletions: [Completion] = []
+    private var rateLimitDetails: (
+        windows: [UsageWindowDisplay],
+        resetCreditCount: Int?,
+        resetCreditExpiresAt: Date?
+    )?
+    private var planType: String?
+    private var dailyBuckets: [UsageDailyBucket] = []
 
     func refresh(completion: @escaping Completion) {
         queue.async { [weak self] in
@@ -1363,7 +1527,7 @@ final class CodexUsageClient {
             self.pendingCompletions.append(completion)
             if self.process?.isRunning == true {
                 if self.initialized {
-                    self.sendRateLimitsRequestIfNeeded()
+                    self.sendUsageRequestsIfNeeded()
                 }
                 return
             }
@@ -1416,7 +1580,7 @@ final class CodexUsageClient {
             readBuffer.removeAll(keepingCapacity: true)
             initialized = false
             isStopping = false
-            currentRequestID = nil
+            pendingRequests.removeAll()
 
             try process.run()
             let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.1.0"
@@ -1462,35 +1626,76 @@ final class CodexUsageClient {
             }
             initialized = true
             send(["method": "initialized"])
-            sendRateLimitsRequestIfNeeded()
+            sendUsageRequestsIfNeeded()
             return
         }
 
-        guard id == currentRequestID else { return }
-        currentRequestID = nil
-        do {
-            guard object["error"] == nil,
-                  let result = object["result"] as? [String: Any] else {
-                throw CodexUsageError.protocolFailed("读取请求失败")
+        guard let requestKind = pendingRequests.removeValue(forKey: id) else { return }
+        if object["error"] == nil,
+           let result = object["result"] as? [String: Any] {
+            switch requestKind {
+            case .rateLimits:
+                do {
+                    rateLimitDetails = try UsageSnapshotParser.rateLimitDetails(from: result)
+                    planType = UsageSnapshotParser.planType(from: result) ?? planType
+                } catch {
+                    failPending(error)
+                    shutdown()
+                    return
+                }
+            case .account:
+                planType = UsageSnapshotParser.planType(from: result) ?? planType
+            case .usage:
+                dailyBuckets = UsageSnapshotParser.dailyBuckets(from: result)
             }
-            let windows = try UsageSnapshotParser.windows(from: result)
-            completePending(with: .success(windows))
-        } catch {
-            completePending(with: .failure(error))
+        } else if requestKind == .rateLimits {
+            failPending(CodexUsageError.protocolFailed("读取限额请求失败"))
+            shutdown()
+            return
         }
+
+        finishUsageRequestsIfReady()
     }
 
-    private func sendRateLimitsRequestIfNeeded() {
-        guard initialized, currentRequestID == nil, !pendingCompletions.isEmpty else { return }
+    private func sendUsageRequestsIfNeeded() {
+        guard initialized, pendingRequests.isEmpty, !pendingCompletions.isEmpty else { return }
+        rateLimitDetails = nil
+        planType = nil
+        dailyBuckets = []
+
+        sendRequest(kind: .rateLimits, method: "account/rateLimits/read", params: NSNull())
+        sendRequest(kind: .account, method: "account/read", params: ["refreshToken": false])
+        sendRequest(kind: .usage, method: "account/usage/read", params: NSNull())
+    }
+
+    private func sendRequest(kind: RequestKind, method: String, params: Any) {
         let requestID = nextRequestID
         nextRequestID += 1
-        currentRequestID = requestID
+        pendingRequests[requestID] = kind
         send([
             "id": requestID,
-            "method": "account/rateLimits/read",
-            "params": NSNull(),
+            "method": method,
+            "params": params,
         ])
         scheduleTimeout(for: requestID)
+    }
+
+    private func finishUsageRequestsIfReady() {
+        guard pendingRequests.isEmpty else { return }
+        guard let rateLimitDetails else {
+            failPending(CodexUsageError.protocolFailed("缺少限额结果"))
+            return
+        }
+        let snapshot = UsageSnapshot(
+            windows: rateLimitDetails.windows,
+            planType: planType,
+            resetCreditCount: rateLimitDetails.resetCreditCount,
+            resetCreditExpiresAt: rateLimitDetails.resetCreditExpiresAt,
+            dailyBuckets: dailyBuckets,
+            localEstimate: LocalUsageEstimator.load(),
+            refreshedAt: Date()
+        )
+        completePending(with: .success(snapshot))
     }
 
     private func send(_ object: [String: Any]) {
@@ -1507,14 +1712,23 @@ final class CodexUsageClient {
     private func scheduleTimeout(for requestID: Int) {
         queue.asyncAfter(deadline: .now() + 15) { [weak self] in
             guard let self else { return }
-            let isStillWaiting = requestID == 1 ? !self.initialized : self.currentRequestID == requestID
-            guard isStillWaiting else { return }
-            self.failPending(CodexUsageError.timedOut)
-            self.shutdown()
+            if requestID == 1 {
+                guard !self.initialized else { return }
+                self.failPending(CodexUsageError.timedOut)
+                self.shutdown()
+                return
+            }
+            guard let requestKind = self.pendingRequests.removeValue(forKey: requestID) else { return }
+            if requestKind == .rateLimits {
+                self.failPending(CodexUsageError.timedOut)
+                self.shutdown()
+            } else {
+                self.finishUsageRequestsIfReady()
+            }
         }
     }
 
-    private func completePending(with result: Result<[UsageWindowDisplay], Error>) {
+    private func completePending(with result: Result<UsageSnapshot, Error>) {
         let completions = pendingCompletions
         pendingCompletions.removeAll()
         completions.forEach { $0(result) }
@@ -1542,7 +1756,10 @@ final class CodexUsageClient {
         outputHandle = nil
         readBuffer.removeAll(keepingCapacity: false)
         initialized = false
-        currentRequestID = nil
+        pendingRequests.removeAll()
+        rateLimitDetails = nil
+        planType = nil
+        dailyBuckets = []
     }
 
     private static func executableURL() throws -> URL {
@@ -1571,6 +1788,8 @@ final class CodexUsageClient {
 final class UsageStore: ObservableObject {
     @Published private(set) var state: UsageState = .loading
 
+    typealias RefreshCompletion = () -> Void
+
     private let client = CodexUsageClient()
     private var refreshTimer: Timer?
 
@@ -1588,13 +1807,14 @@ final class UsageStore: ObservableObject {
         client.stop()
     }
 
-    func refresh() {
+    func refresh(completion: RefreshCompletion? = nil) {
         client.refresh { [weak self] result in
             DispatchQueue.main.async {
+                defer { completion?() }
                 guard let self else { return }
                 switch result {
-                case let .success(windows):
-                    self.state = .available(windows)
+                case let .success(snapshot):
+                    self.state = .available(snapshot)
                 case let .failure(error):
                     self.state = .unavailable(error.localizedDescription)
                 }
@@ -1753,6 +1973,9 @@ struct TaskListView: View {
     @ObservedObject var usageStore: UsageStore
     @ObservedObject var windowMode: WindowModeModel
     @State private var searchText = ""
+    @State private var isRefreshing = false
+    @State private var refreshRotation = 0.0
+    @State private var isUsageAnalyticsExpanded = false
 
     private var groups: [TaskGroup] {
         store.groups(matching: searchText)
@@ -1799,15 +2022,17 @@ struct TaskListView: View {
                 Spacer()
 
                 Button {
-                    store.refresh()
-                    usageStore.refresh()
+                    refreshNow()
                 } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 13, weight: .semibold))
                         .frame(width: 28, height: 28)
+                        .rotationEffect(.degrees(refreshRotation))
+                        .opacity(isRefreshing ? 0.75 : 1)
                 }
                 .buttonStyle(.plain)
                 .background(Color.primary.opacity(0.06), in: Circle())
+                .disabled(isRefreshing)
                 .help("立即刷新任务与剩余用量")
                 .accessibilityLabel("立即刷新任务与剩余用量")
             }
@@ -1831,6 +2056,12 @@ struct TaskListView: View {
             .help(windowMode.mode == .docked ? "拖动标题区域向左或向右切换吸附位置" : "拖动窗口可自由移动")
 
             usageSummary
+            usageResetSummary
+            usageAnalyticsDisclosure
+
+            if isUsageAnalyticsExpanded {
+                usageAnalyticsPanel
+            }
 
             HStack(spacing: 8) {
                 windowModeButton(
@@ -1865,6 +2096,33 @@ struct TaskListView: View {
         .padding(.bottom, 10)
     }
 
+    private func refreshNow() {
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        withAnimation(.linear(duration: 0.7).repeatForever(autoreverses: false)) {
+            refreshRotation += 360
+        }
+
+        let startedAt = Date()
+        var remainingRefreshes = 2
+        let markFinished = {
+            remainingRefreshes -= 1
+            guard remainingRefreshes == 0 else { return }
+
+            let elapsed = Date().timeIntervalSince(startedAt)
+            let delay = max(0.0, 0.45 - elapsed)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    isRefreshing = false
+                    refreshRotation = 0
+                }
+            }
+        }
+
+        store.refresh(completion: markFinished)
+        usageStore.refresh(completion: markFinished)
+    }
+
     private var usageSummary: some View {
         HStack(spacing: 7) {
             Image(systemName: "gauge.with.dots.needle.50percent")
@@ -1875,11 +2133,11 @@ struct TaskListView: View {
             case .loading:
                 Text("正在读取剩余用量…")
                     .foregroundStyle(.secondary)
-            case let .available(windows):
+            case let .available(snapshot):
                 Text("剩余用量")
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 4)
-                ForEach(windows) { window in
+                ForEach(snapshot.windows) { window in
                     HStack(spacing: 3) {
                         Text(window.label)
                             .foregroundStyle(.secondary)
@@ -1908,16 +2166,59 @@ struct TaskListView: View {
         .help(usageHelpText)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(usageAccessibilityLabel)
+        .animation(nil, value: isUsageAnalyticsExpanded)
     }
 
     private var usageTint: Color {
         switch usageStore.state {
         case .loading:
             return .secondary
-        case let .available(windows):
-            return windows.map(\.remainingPercent).min().map(usageColor(for:)) ?? .secondary
+        case let .available(snapshot):
+            return snapshot.windows.map(\.remainingPercent).min().map(usageColor(for:)) ?? .secondary
         case .unavailable:
             return .orange
+        }
+    }
+
+    @ViewBuilder
+    private var usageResetSummary: some View {
+        if case let .available(snapshot) = usageStore.state {
+            let resetWindows = snapshot.windows.filter { $0.resetsAt != nil }
+            if !resetWindows.isEmpty {
+                VStack(spacing: 5) {
+                    ForEach(resetWindows) { window in
+                        if let resetsAt = window.resetsAt {
+                            HStack(spacing: 7) {
+                                Image(systemName: window.durationMinutes == 10_080
+                                    ? "calendar.badge.clock"
+                                    : "clock")
+                                    .font(.system(size: 11.5, weight: .semibold))
+                                    .foregroundStyle(usageTint)
+
+                                Text("\(window.label)额度")
+                                    .foregroundStyle(.secondary)
+
+                                Spacer(minLength: 4)
+
+                                Text(relativeResetText(resetsAt, now: store.now))
+                                    .foregroundStyle(.secondary)
+                                    .monospacedDigit()
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.88)
+                            }
+                            .font(.system(size: 10.5))
+                            .padding(.horizontal, 9)
+                            .frame(height: 28)
+                            .background(
+                                Color.primary.opacity(0.045),
+                                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            )
+                            .accessibilityElement(children: .combine)
+                        }
+                    }
+                }
+                .animation(nil, value: isUsageAnalyticsExpanded)
+            }
         }
     }
 
@@ -1932,7 +2233,7 @@ struct TaskListView: View {
         case .loading:
             return "正在通过 Codex 官方服务读取剩余用量"
         case .available:
-            return "剩余用量每 60 秒刷新。不显示重置时间。"
+            return "剩余用量和额度重置时间每 60 秒刷新。"
         case let .unavailable(message):
             return message
         }
@@ -1942,12 +2243,353 @@ struct TaskListView: View {
         switch usageStore.state {
         case .loading:
             return "正在读取剩余用量"
-        case let .available(windows):
-            let details = windows.map { "\($0.label)剩余\($0.remainingPercent)%" }.joined(separator: "，")
+        case let .available(snapshot):
+            let details = snapshot.windows.map { window in
+                var detail = "\(window.label)剩余\(window.remainingPercent)%"
+                if let resetsAt = window.resetsAt {
+                    detail += "，\(relativeResetText(resetsAt, now: store.now))"
+                }
+                return detail
+            }.joined(separator: "，")
             return "剩余用量，\(details)"
         case .unavailable:
             return "用量暂时不可用"
         }
+    }
+
+    private var usageAnalyticsDisclosure: some View {
+        Button {
+            var transaction = Transaction(animation: nil)
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                isUsageAnalyticsExpanded.toggle()
+            }
+        } label: {
+            HStack(spacing: 7) {
+                Image(systemName: "chart.bar.xaxis")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                Text("用量统计")
+                    .font(.system(size: 11.5, weight: .semibold))
+                Spacer()
+                if case let .available(snapshot) = usageStore.state {
+                    Text(accountSummary(snapshot))
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .rotationEffect(.degrees(isUsageAnalyticsExpanded ? 180 : 0))
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(isUsageAnalyticsExpanded ? "收起用量统计" : "展开用量统计")
+    }
+
+    @ViewBuilder
+    private var usageAnalyticsPanel: some View {
+        switch usageStore.state {
+        case .loading:
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("正在读取统计数据…")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .frame(height: 44)
+        case let .unavailable(message):
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+                Text("统计数据暂时不可用")
+                    .font(.system(size: 10.5, weight: .medium))
+                Spacer()
+            }
+            .frame(height: 44)
+            .help(message)
+        case let .available(snapshot):
+            VStack(spacing: 9) {
+                resetCreditRow(snapshot)
+
+                Divider()
+                    .opacity(0.45)
+
+                HStack(spacing: 0) {
+                    analyticsMetric(
+                        title: "\(latestDailyUsage(in: snapshot).label) token",
+                        value: compactTokenCount(latestDailyUsage(in: snapshot).tokens)
+                    )
+                    Divider()
+                    analyticsMetric(
+                        title: "近 30 天 token",
+                        value: compactTokenCount(last30DayTokens(in: snapshot))
+                    )
+                }
+                .frame(height: 42)
+
+                HStack(spacing: 0) {
+                    analyticsMetric(
+                        title: "\(latestDailyUsage(in: snapshot).label)等效 API 成本",
+                        value: estimatedCostText(tokens: latestDailyUsage(in: snapshot).tokens, snapshot: snapshot)
+                    )
+                    Divider()
+                    analyticsMetric(
+                        title: "近 30 天等效 API 成本",
+                        value: estimatedCostText(tokens: last30DayTokens(in: snapshot), snapshot: snapshot)
+                    )
+                }
+                .frame(height: 42)
+
+                Divider()
+                    .opacity(0.45)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack {
+                        Text("近 30 天 token 趋势")
+                        Spacer()
+                        Text("峰值 \(compactTokenCount(chartBuckets(snapshot).map(\.tokens).max() ?? 0))")
+                    }
+                    .font(.system(size: 9.5, weight: .medium))
+                    .foregroundStyle(.secondary)
+
+                    usageBarChart(chartBuckets(snapshot))
+                        .frame(height: 52)
+                }
+
+                Divider()
+                    .opacity(0.45)
+
+                HStack {
+                    Text("最常用模型")
+                        .font(.system(size: 10.5, weight: .medium))
+                    Spacer()
+                    Text(snapshot.localEstimate.mostUsedModel ?? "暂无数据")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .lineLimit(1)
+                }
+
+                Text(analyticsFootnote(snapshot))
+                    .font(.system(size: 8.5))
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 9)
+            .background(
+                Color.primary.opacity(0.028),
+                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+            )
+        }
+    }
+
+    private func resetCreditRow(_ snapshot: UsageSnapshot) -> some View {
+        HStack(spacing: 7) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("限额重置额度")
+                    .font(.system(size: 10.5, weight: .medium))
+                Text(resetCreditCountText(snapshot.resetCreditCount))
+                    .font(.system(size: 11.5, weight: .semibold))
+            }
+            Spacer()
+            if let expiration = snapshot.resetCreditExpiresAt {
+                Label(relativeExpirationText(expiration), systemImage: "clock")
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("有效期未提供")
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private func analyticsMetric(title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 8.5))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+            Text(value)
+                .font(.system(size: 13, weight: .semibold))
+                .monospacedDigit()
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 7)
+    }
+
+    private func usageBarChart(_ buckets: [UsageDailyBucket]) -> some View {
+        GeometryReader { geometry in
+            let peak = max(1, buckets.map(\.tokens).max() ?? 1)
+            let peakIndex = buckets.firstIndex(where: { $0.tokens == peak })
+            let count = max(1, buckets.count)
+            let spacing: CGFloat = 2
+            let totalSpacing = spacing * CGFloat(max(0, count - 1))
+            let barWidth = max(2, (geometry.size.width - totalSpacing) / CGFloat(count))
+
+            HStack(alignment: .bottom, spacing: spacing) {
+                ForEach(Array(buckets.enumerated()), id: \.element.id) { index, bucket in
+                    let ratio = Double(bucket.tokens) / Double(peak)
+                    RoundedRectangle(cornerRadius: min(2, barWidth / 2), style: .continuous)
+                        .fill(chartColor(index: index, isPeak: index == peakIndex && bucket.tokens > 0))
+                        .frame(
+                            width: barWidth,
+                            height: max(bucket.tokens > 0 ? 3 : 1, geometry.size.height * ratio)
+                        )
+                        .accessibilityLabel("\(bucket.dateKey)，\(compactTokenCount(bucket.tokens)) token")
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+        }
+    }
+
+    private func chartColor(index: Int, isPeak: Bool) -> Color {
+        if isPeak {
+            return Color(nsColor: .systemOrange)
+        }
+        switch index % 3 {
+        case 0:
+            return Color(nsColor: .systemBlue).opacity(0.82)
+        case 1:
+            return Color(nsColor: .systemCyan).opacity(0.88)
+        default:
+            return Color(nsColor: .systemIndigo).opacity(0.78)
+        }
+    }
+
+    private func accountSummary(_ snapshot: UsageSnapshot) -> String {
+        let plan = displayPlanType(snapshot.planType) ?? "Codex"
+        let elapsed = max(0, Date().timeIntervalSince(snapshot.refreshedAt))
+        return elapsed < 60 ? "\(plan) · 刚刚更新" : "\(plan) · \(Int(elapsed / 60)) 分钟前"
+    }
+
+    private func displayPlanType(_ rawPlan: String?) -> String? {
+        guard let rawPlan else { return nil }
+        let normalized = rawPlan.lowercased()
+        if normalized == "promax" || normalized == "pro_max" || normalized == "pro-max" {
+            return "Pro Max"
+        }
+        if normalized == "prolite" || normalized == "pro_lite" || normalized == "pro-lite" {
+            return "Pro Lite"
+        }
+        if normalized.contains("plus") {
+            return "Plus"
+        }
+        if normalized.contains("pro") {
+            return "Pro"
+        }
+        return rawPlan.prefix(1).uppercased() + rawPlan.dropFirst()
+    }
+
+    private func relativeResetText(_ date: Date, now: Date) -> String {
+        let remaining = max(0, Int(date.timeIntervalSince(now)))
+        if remaining == 0 { return "即将重置" }
+
+        let totalMinutes = max(1, remaining / 60)
+        let days = totalMinutes / 1_440
+        let hours = (totalMinutes % 1_440) / 60
+        let minutes = totalMinutes % 60
+
+        if days > 0 {
+            return hours > 0 ? "\(days) 天 \(hours) 小时后重置" : "\(days) 天后重置"
+        }
+        if hours > 0 {
+            return minutes > 0 ? "\(hours) 小时 \(minutes) 分后重置" : "\(hours) 小时后重置"
+        }
+        return "\(minutes) 分钟后重置"
+    }
+
+    private func resetCreditCountText(_ count: Int?) -> String {
+        guard let count else { return "暂未提供" }
+        return count > 0 ? "\(count) 次可用" : "暂无可用"
+    }
+
+    private func relativeExpirationText(_ date: Date) -> String {
+        let interval = max(0, date.timeIntervalSinceNow)
+        let totalHours = Int(interval / 3600)
+        let days = totalHours / 24
+        let hours = totalHours % 24
+        if days > 0 { return "\(days) 天 \(hours) 小时后到期" }
+        if totalHours > 0 { return "\(totalHours) 小时后到期" }
+        return "即将到期"
+    }
+
+    private func latestDailyUsage(in snapshot: UsageSnapshot) -> (label: String, tokens: Int64, dateKey: String?) {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd"
+        let todayKey = formatter.string(from: Date())
+        if let today = snapshot.dailyBuckets.first(where: { $0.dateKey == todayKey }) {
+            return ("今日", today.tokens, today.dateKey)
+        }
+
+        guard let latest = snapshot.dailyBuckets.max(by: { $0.dateKey < $1.dateKey }) else {
+            return ("今日", 0, nil)
+        }
+        if let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: Date()),
+           latest.dateKey == formatter.string(from: yesterday) {
+            return ("昨日", latest.tokens, latest.dateKey)
+        }
+        return ("\(String(latest.dateKey.suffix(5)))", latest.tokens, latest.dateKey)
+    }
+
+    private func last30DayTokens(in snapshot: UsageSnapshot) -> Int64 {
+        chartBuckets(snapshot).reduce(0) { $0 + $1.tokens }
+    }
+
+    private func chartBuckets(_ snapshot: UsageSnapshot) -> [UsageDailyBucket] {
+        let calendar = Calendar.current
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd"
+        let tokenByDate = snapshot.dailyBuckets.reduce(into: [String: Int64]()) { result, bucket in
+            result[bucket.dateKey, default: 0] += bucket.tokens
+        }
+        return (0..<30).compactMap { offset in
+            guard let date = calendar.date(byAdding: .day, value: offset - 29, to: Date()) else { return nil }
+            let dateKey = formatter.string(from: date)
+            return UsageDailyBucket(dateKey: dateKey, tokens: tokenByDate[dateKey] ?? 0)
+        }
+    }
+
+    private func compactTokenCount(_ tokens: Int64) -> String {
+        let value = Double(tokens)
+        if tokens >= 1_000_000_000 {
+            return String(format: "%.1fB", value / 1_000_000_000)
+        }
+        if tokens >= 1_000_000 {
+            return String(format: "%.1fM", value / 1_000_000)
+        }
+        if tokens >= 1_000 {
+            return String(format: "%.1fK", value / 1_000)
+        }
+        return "\(tokens)"
+    }
+
+    private func estimatedCostText(tokens: Int64, snapshot: UsageSnapshot) -> String {
+        guard let rate = snapshot.localEstimate.inputPricePerMillionTokens else {
+            return "—"
+        }
+        return String(format: "$%.2f", Double(tokens) / 1_000_000 * rate)
+    }
+
+    private func analyticsFootnote(_ snapshot: UsageSnapshot) -> String {
+        let dailyUsage = latestDailyUsage(in: snapshot)
+        let estimateNote = "费用按最常用模型的官方输入价估算，不代表实际账单"
+        guard dailyUsage.label != "今日", let dateKey = dailyUsage.dateKey else {
+            return estimateNote
+        }
+        return "官方每日数据截至 \(String(dateKey.suffix(5)))；\(estimateNote)"
     }
 
     private func windowModeButton(title: String, icon: String, mode: WindowDisplayMode) -> some View {
@@ -2040,7 +2682,9 @@ struct TaskListView: View {
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .textSelection(.enabled)
-                Button("重新读取", action: store.refresh)
+                Button("重新读取") {
+                    store.refresh()
+                }
             }
             .padding(24)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -2643,24 +3287,70 @@ enum SelfTest {
 
             let usageFixture: [String: Any] = [
                 "rateLimits": [
-                    "primary": ["usedPercent": 35, "windowDurationMins": 300],
-                    "secondary": ["usedPercent": 90, "windowDurationMins": 10_080],
+                    "planType": "plus",
+                    "primary": [
+                        "usedPercent": 35,
+                        "windowDurationMins": 300,
+                        "resetsAt": 4_102_444_800,
+                    ],
+                    "secondary": [
+                        "usedPercent": 90,
+                        "windowDurationMins": 10_080,
+                        "resetsAt": 4_102_704_000,
+                    ],
                 ],
             ]
             let usageWindows = try UsageSnapshotParser.windows(from: usageFixture)
             guard usageWindows == [
-                UsageWindowDisplay(label: "5 小时", remainingPercent: 65),
-                UsageWindowDisplay(label: "每周", remainingPercent: 10),
+                UsageWindowDisplay(
+                    label: "5 小时",
+                    remainingPercent: 65,
+                    durationMinutes: 300,
+                    resetsAt: Date(timeIntervalSince1970: 4_102_444_800)
+                ),
+                UsageWindowDisplay(
+                    label: "每周",
+                    remainingPercent: 10,
+                    durationMinutes: 10_080,
+                    resetsAt: Date(timeIntervalSince1970: 4_102_704_000)
+                ),
             ] else {
                 fputs("SELF_TEST_FAILED usage parsing\n", stderr)
+                return 8
+            }
+            guard UsageSnapshotParser.planType(from: usageFixture) == "plus" else {
+                fputs("SELF_TEST_FAILED usage plan parsing\n", stderr)
                 return 8
             }
 
             let clampedUsage = try UsageSnapshotParser.windows(from: [
                 "rateLimits": ["primary": ["usedPercent": 120]],
             ])
-            guard clampedUsage == [UsageWindowDisplay(label: "主要额度", remainingPercent: 0)] else {
+            guard clampedUsage == [
+                UsageWindowDisplay(
+                    label: "主要额度",
+                    remainingPercent: 0,
+                    durationMinutes: nil,
+                    resetsAt: nil
+                ),
+            ] else {
                 fputs("SELF_TEST_FAILED usage clamping\n", stderr)
+                return 9
+            }
+
+            let weeklyOnlyUsage = try UsageSnapshotParser.windows(from: [
+                "rateLimits": [
+                    "primary": [
+                        "usedPercent": 3,
+                        "windowDurationMins": 10_080,
+                        "resetsAt": 4_102_704_000,
+                    ],
+                    "secondary": NSNull(),
+                ],
+            ])
+            guard weeklyOnlyUsage.count == 1,
+                  weeklyOnlyUsage.first?.label == "每周" else {
+                fputs("SELF_TEST_FAILED optional five-hour usage\n", stderr)
                 return 9
             }
 
@@ -2795,7 +3485,7 @@ enum UsageClientSelfTest {
         let client = CodexUsageClient()
         let semaphore = DispatchSemaphore(value: 0)
         let lock = NSLock()
-        var capturedResult: Result<[UsageWindowDisplay], Error>?
+        var capturedResult: Result<UsageSnapshot, Error>?
 
         client.refresh { result in
             lock.lock()
@@ -2815,15 +3505,39 @@ enum UsageClientSelfTest {
         lock.unlock()
 
         switch result {
-        case let .success(windows):
-            guard !expectFixtureValues || windows == [
-                    UsageWindowDisplay(label: "5 小时", remainingPercent: 65),
-                    UsageWindowDisplay(label: "每周", remainingPercent: 10),
-                  ] else {
+        case let .success(snapshot):
+            guard !expectFixtureValues || (
+                snapshot.windows == [
+                    UsageWindowDisplay(
+                        label: "5 小时",
+                        remainingPercent: 65,
+                        durationMinutes: 300,
+                        resetsAt: Date(timeIntervalSince1970: 4_102_444_800)
+                    ),
+                    UsageWindowDisplay(
+                        label: "每周",
+                        remainingPercent: 10,
+                        durationMinutes: 10_080,
+                        resetsAt: Date(timeIntervalSince1970: 4_102_704_000)
+                    ),
+                ]
+                && snapshot.planType == "prolite"
+                && snapshot.resetCreditCount == 1
+                && snapshot.dailyBuckets == [
+                    UsageDailyBucket(dateKey: "2099-12-31", tokens: 12_000_000),
+                    UsageDailyBucket(dateKey: "2100-01-01", tokens: 15_000_000),
+                ]
+                && snapshot.localEstimate.mostUsedModel == "gpt-5.5"
+                && snapshot.localEstimate.inputPricePerMillionTokens == 5.0
+            ) else {
                 fputs("USAGE_SELF_TEST_FAILED unexpected values\n", stderr)
                 return 11
             }
-            print(expectFixtureValues ? "USAGE_SELF_TEST_OK windows=2" : "USAGE_PROBE_OK windows=\(windows.count)")
+            print(
+                expectFixtureValues
+                    ? "USAGE_SELF_TEST_OK windows=2 analytics=ok"
+                    : "USAGE_PROBE_OK windows=\(snapshot.windows.count) analytics=\(snapshot.dailyBuckets.count)"
+            )
             return 0
         case let .failure(error):
             fputs("USAGE_SELF_TEST_FAILED \(error.localizedDescription)\n", stderr)
