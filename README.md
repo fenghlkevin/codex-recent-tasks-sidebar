@@ -8,6 +8,14 @@
 
 > 这是非 OpenAI 官方项目。目前支持 macOS 13 及以上版本，并在 Apple Silicon Mac 上完成验证。
 
+## 界面预览
+
+| 最近任务与窗口控制 | 展开的用量统计 |
+| --- | --- |
+| ![使用虚拟任务数据的 Codex 最近任务栏主界面](docs/images/sidebar-overview.jpg) | ![使用虚拟用量数据的 Codex 最近任务栏统计界面](docs/images/usage-analytics.jpg) |
+
+> 截图由仓库 QA 固定数据生成，不包含真实任务、项目路径或账号用量。
+
 ## 主要功能
 
 ### 最近任务

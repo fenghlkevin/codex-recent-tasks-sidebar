@@ -8,6 +8,14 @@ It groups tasks from the last 48 hours by project directory and provides exact t
 
 > This is an unofficial project and is not affiliated with OpenAI. It supports macOS 13 or later and has been validated on Apple Silicon Macs.
 
+## Preview
+
+| Recent tasks and window controls | Expanded usage analytics |
+| --- | --- |
+| ![Codex Recent Tasks Sidebar with fixture task data](docs/images/sidebar-overview.jpg) | ![Codex Recent Tasks Sidebar with fixture usage data](docs/images/usage-analytics.jpg) |
+
+> These screenshots were generated from repository QA fixtures. They contain no real tasks, project paths, or account usage.
+
 ## Features
 
 ### Recent tasks
