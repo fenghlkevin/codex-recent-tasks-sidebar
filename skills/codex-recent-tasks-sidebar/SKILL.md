@@ -1,6 +1,6 @@
 ---
 name: codex-recent-tasks-sidebar
-description: Build, customize, validate, or repair a native macOS Codex recent-tasks companion window. Use when a user wants a Dock-visible SwiftUI utility that reads recent Codex tasks, running/attention/unread state, and remaining usage, groups tasks by working folder, shows activity times, opens exact tasks, docks on either side of Codex, follows Codex foreground state, or stays independently pinned.
+description: Build, customize, validate, or repair a native macOS Codex recent-tasks menu bar companion. Use when a user wants a SwiftUI utility that reads recent Codex tasks, running/attention/unread state, remaining usage, reset times, account plan, and usage analytics; groups tasks by working folder; opens exact tasks; docks on either side of Codex; follows Codex window state; or stays independently pinned.
 ---
 
 # Codex Recent Tasks Sidebar
@@ -14,11 +14,11 @@ Build from the bundled template instead of recreating the app. Preserve its read
 3. Use `scripts/build_app.sh [output-directory]`. The script compiles the template for the current Mac architecture and creates an ad-hoc-signed `CodexRecentTasksSidebar.app` whose visible name is “Codex 最近任务”.
 4. Run the repository-level `scripts/qa.sh` when working from the full repository. If the Skill is installed alone, run the built binary with `--self-test` against a disposable SQLite fixture and `--usage-self-test` against a fake executable supplied through `CODEX_APP_SERVER_OVERRIDE` before using real data.
 5. Launch the app and verify the real UI:
-   - the custom icon and Dock item are present;
+   - the custom menu bar icon is present and the app does not occupy the Dock;
    - recent tasks are grouped by canonical working folder and sorted newest first;
    - renamed task notes from `session_index.jsonl` replace stale database titles on the next refresh;
    - status priority is “待操作 → 运行中 → 待查看 → time”: an active task never shows “待查看” early, a stopped unread task does, and opening it clears the label after refresh;
-   - remaining usage percentages appear without reset times; a usage failure leaves the task list usable;
+   - remaining usage, available reset windows, account plan, and expandable analytics appear; a usage failure leaves the task list usable;
    - left and right docking both work;
    - docked mode follows the Codex foreground/background layer;
    - pinned mode stays above other apps and remains draggable;
