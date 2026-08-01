@@ -14,7 +14,11 @@
 | --- | --- |
 | ![使用虚拟任务数据的 Codex 最近任务栏主界面](docs/images/sidebar-overview.jpg) | ![使用虚拟用量数据的 Codex 最近任务栏统计界面](docs/images/usage-analytics.jpg) |
 
-> 截图由仓库 QA 固定数据生成，不包含真实任务、项目路径或账号用量。
+### 智能工作报告
+
+![使用固定虚拟数据生成的 Codex 智能工作报告](docs/images/work-report.png)
+
+> 三张截图均由仓库 QA 固定数据生成，不包含真实任务、项目路径或账号用量。
 
 ## v1.5.1 更新摘要
 

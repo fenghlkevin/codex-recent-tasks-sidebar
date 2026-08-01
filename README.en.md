@@ -14,7 +14,11 @@ It groups tasks from the last 48 hours by project directory and provides exact t
 | --- | --- |
 | ![Codex Recent Tasks Sidebar with fixture task data](docs/images/sidebar-overview.jpg) | ![Codex Recent Tasks Sidebar with fixture usage data](docs/images/usage-analytics.jpg) |
 
-> These screenshots were generated from repository QA fixtures. They contain no real tasks, project paths, or account usage.
+### Smart work report
+
+![Codex smart work report generated from deterministic fixture data](docs/images/work-report.png)
+
+> All three screenshots were generated from repository QA fixtures. They contain no real tasks, project paths, or account usage.
 
 ## v1.5.1 highlights
 
