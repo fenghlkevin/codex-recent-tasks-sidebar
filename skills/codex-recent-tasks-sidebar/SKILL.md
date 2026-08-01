@@ -1,6 +1,6 @@
 ---
 name: codex-recent-tasks-sidebar
-description: Build, customize, validate, or repair a native macOS Codex recent-tasks menu bar companion. Use when a user wants a SwiftUI utility that reads recent Codex tasks, running/attention/unread state, remaining usage, reset times, account plan, and usage analytics; groups tasks by working folder; opens exact tasks; docks on either side of Codex; follows Codex window state; or stays independently pinned.
+description: Build, customize, validate, or repair a native macOS Codex recent-tasks menu bar companion. Use when a user wants a SwiftUI utility that reads recent Codex tasks, running/attention/unread state, remaining usage, reset times, account plan, usage analytics, and Codex-generated daily or weekly reports with a local fallback; groups tasks by working folder; opens exact tasks; docks on either side of Codex; follows Codex window state; or stays independently pinned.
 ---
 
 # Codex Recent Tasks Sidebar
@@ -10,7 +10,7 @@ Build from the bundled template instead of recreating the app. Preserve its read
 ## Workflow
 
 1. Confirm the machine is macOS 13 or newer and has `/usr/bin/swiftc`, `/usr/bin/sqlite3`, `/usr/bin/codesign`, and `/usr/bin/plutil`.
-2. Confirm Codex or the ChatGPT desktop app has been used at least once. Locate its task database, `session_index.jsonl`, `.codex-global-state.json`, and per-task rollout file under `~/.codex/` without copying, printing, or committing task contents or task IDs. Read only rollout event types, tool names, completion IDs, and the approval-policy field needed to distinguish running from waiting; never display or log rollout payload content. The global state is used only to match each visible top-level task's own Codex unread state; never promote a child thread's residual unread state to its parent. Remaining usage is enabled by default and requires the official bundled `codex app-server` plus the user's existing signed-in state.
+2. Confirm Codex or the ChatGPT desktop app has been used at least once. Locate its task database, `session_index.jsonl`, `.codex-global-state.json`, and per-task rollout file under `~/.codex/` without copying, printing, or committing task contents or task IDs. Normal task-state refresh reads only rollout event types, tool names, completion IDs, and the approval-policy field needed to distinguish running from waiting. An explicit daily/weekly report action may read user and assistant messages for the selected time range, trim and redact them, and send that minimized context to an ephemeral Codex process for structured summarization. Never send thread IDs, absolute project paths, tool logs, full code, or obvious secrets, and never log report input or raw model output. The global state is used only to match each visible top-level task's own Codex unread state; never promote a child thread's residual unread state to its parent. Remaining usage is enabled by default and requires the official bundled `codex app-server` plus the user's existing signed-in state.
 3. Use `scripts/build_app.sh [output-directory]`. The script compiles the template for the current Mac architecture and creates an ad-hoc-signed `CodexRecentTasksSidebar.app` whose visible name is “Codex 最近任务”.
 4. Run the repository-level `scripts/qa.sh` when working from the full repository. If the Skill is installed alone, run the built binary with `--self-test` against a disposable SQLite fixture and `--usage-self-test` against a fake executable supplied through `CODEX_APP_SERVER_OVERRIDE` before using real data.
 5. Launch the app and verify the real UI:
@@ -19,6 +19,7 @@ Build from the bundled template instead of recreating the app. Preserve its read
    - renamed task notes from `session_index.jsonl` replace stale database titles on the next refresh;
    - status priority is “待操作 → 运行中 → 待查看 → time”: an active task never shows “待查看” early, a stopped unread task does, and opening it clears the label after refresh;
    - remaining usage, available reset windows, account plan, and expandable analytics appear; a usage failure leaves the task list usable;
+   - opening the report window or switching its period never starts generation; an explicit Generate or Regenerate action switches between today and the current week, groups results by project, creates one concise sentence per task, and copies/exports Markdown;
    - left and right docking both work;
    - docked mode follows the Codex foreground/background layer;
    - pinned mode stays above other apps and remains draggable;
@@ -35,6 +36,7 @@ The public template intentionally uses the generic bundle identifier `io.github.
 ## Safety boundaries
 
 - Treat the Codex SQLite database, rollout files, `session_index.jsonl`, and `.codex-global-state.json` as read-only. Never migrate, vacuum, replace, upload, or write to them.
+- Read user and assistant text only after an explicit report action. Minimize and redact it before an ephemeral Codex summary, keep generated results in memory for the visible report, and never include raw task text in diagnostics or QA output.
 - Fetch remaining usage only through the official `codex app-server` using the existing login state. Do not read, print, persist, or commit auth files, tokens, raw account responses, or reset timestamps.
 - Never commit a real `.sqlite` file, task title, thread ID, username path, API key, token, crash log, or local build cache.
 - Keep task selection keyed by the unique thread ID; titles are not unique identifiers.

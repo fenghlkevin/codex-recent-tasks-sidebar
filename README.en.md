@@ -16,6 +16,14 @@ It groups tasks from the last 48 hours by project directory and provides exact t
 
 > These screenshots were generated from repository QA fixtures. They contain no real tasks, project paths, or account usage.
 
+## v1.5.1 highlights
+
+- Adds Codex-generated daily and weekly reports with one-sentence outcomes, completion estimates, overall summaries, next-step suggestions, and Markdown export.
+- Opening the report window or switching its period never starts generation. Selected, redacted context is read only after an explicit Generate Report action.
+- Shows the current stage, estimated progress, and elapsed time while generating, with a local-summary fallback when Codex is unavailable.
+- Expands usage analytics, reset-time and account-plan presentation, diagnostics, and database retry handling.
+- Refines Docked/Pinned controls, left/right docking, project shortcuts, and window-width presets.
+
 ## Features
 
 ### Recent tasks
@@ -36,6 +44,17 @@ Right-click a task to:
 - Open the project in Terminal
 
 The Terminal action uses the built-in macOS Terminal app and opens directly in the project directory.
+
+### Automatic daily and weekly reports
+
+- Opens a separate Work Report window from the sidebar header or menu bar.
+- Filters tasks for today or the current week and groups them by project.
+- Uses the user's requests as primary evidence and assistant outcomes as supporting evidence, then asks Codex for a one-sentence result and completion estimate.
+- Generates an overall summary and suggested next steps.
+- Shows the current stage, estimated percentage, and elapsed time while generating; it never displays 100% before the complete result arrives.
+- Copies Markdown or exports a `.md` file.
+
+Opening the report window or switching between daily and weekly reports does not generate anything. Generation starts only after the user explicitly clicks Generate Report or Regenerate. The app trims user requests and assistant outcomes to the selected period, removes tool records, code blocks, absolute paths, and obvious secrets, then runs an ephemeral structured Codex summary. If Codex is unavailable, times out, or returns invalid output, the app falls back to its local summary.
 
 ### Window and ChatGPT integration
 
@@ -112,6 +131,7 @@ LaunchAgent integration is optional. Even when an existing agent uses `RunAtLoad
 The menu bar icon provides:
 
 - Show Sidebar
+- Work Report
 - Refresh
 - Request Accessibility Permission
 - Window Width: Narrow / Medium / Wide
@@ -131,7 +151,9 @@ Usage, reset times, and plan information come from the official `codex app-serve
 Privacy boundaries:
 
 - Never modifies, migrates, vacuums, or replaces the Codex database.
-- Never uploads task titles, task content, thread IDs, project paths, or event-stream payloads.
+- The normal task list never uploads task titles, task content, thread IDs, project paths, or event-stream payloads.
+- Only after the user explicitly clicks Generate Report or Regenerate are trimmed and redacted user requests and assistant outcomes sent to Codex through the current signed-in account. Thread IDs, absolute project paths, tool logs, and full code are excluded.
+- Smart reports use a temporary read-only directory and an ephemeral session, create no persistent Codex task, never write back to Codex data, and never log report input or raw model output.
 - Never prints or persists login tokens or raw account responses.
 - Diagnostic logs contain candidate database paths, file status, SQLite error codes, and retry outcomes only. They do not contain task content.
 - `UserDefaults` stores only window placement, width, dock side, display mode, and usage-panel state.
@@ -161,6 +183,7 @@ QA covers:
 - Task-name index and unread-state checks
 - Read-only hash checks across five fixture data sources
 - Usage windows, account plan, reset credits, and analytics protocol checks
+- Daily/weekly filtering, context redaction, staged progress, structured Codex output, and local fallback checks
 - Missing database, index, state, and usage-service boundaries
 - Dock placement boundaries
 - Secret and personal-data scanning

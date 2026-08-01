@@ -12,6 +12,7 @@ FIXTURE_GLOBAL_STATE="$FIXTURE_DIR/codex-global-state.json"
 FIXTURE_RUNNING_ROLLOUT="$FIXTURE_DIR/running-rollout.jsonl"
 FIXTURE_ACTION_ROLLOUT="$FIXTURE_DIR/action-rollout.jsonl"
 FIXTURE_USAGE_SERVER="$FIXTURE_DIR/fake-codex"
+FIXTURE_REPORT_CODEX="$FIXTURE_DIR/fake-report-codex"
 
 "$ROOT/scripts/build_app.sh"
 /usr/bin/plutil -lint "$APP_DIR/Contents/Info.plist"
@@ -113,6 +114,27 @@ done
 ZSH
 chmod +x "$FIXTURE_USAGE_SERVER"
 
+cat > "$FIXTURE_REPORT_CODEX" <<'ZSH'
+#!/bin/zsh
+set -euo pipefail
+output_path=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output-last-message)
+      output_path="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+prompt="$(/bin/cat)"
+[[ -n "$output_path" && "$prompt" == *"请完善权限模块并补充测试"* ]] || exit 31
+print -r -- '{"items":[{"key":"item-1","summary":"完成权限模块改造并补充固定测试。","completion_percent":100}],"overall_summary":"完成权限模块改造，相关固定测试已通过。","next_steps":"继续验证边界场景并整理交付说明。"}' > "$output_path"
+ZSH
+chmod +x "$FIXTURE_REPORT_CODEX"
+
 before_hash="$(/usr/bin/shasum "$FIXTURE_DB")"
 before_index_hash="$(/usr/bin/shasum "$FIXTURE_INDEX")"
 before_global_state_hash="$(/usr/bin/shasum "$FIXTURE_GLOBAL_STATE")"
@@ -136,7 +158,7 @@ after_global_state_hash="$(/usr/bin/shasum "$FIXTURE_GLOBAL_STATE")"
 after_running_rollout_hash="$(/usr/bin/shasum "$FIXTURE_RUNNING_ROLLOUT")"
 after_action_rollout_hash="$(/usr/bin/shasum "$FIXTURE_ACTION_ROLLOUT")"
 
-[[ "$self_test_output" == *"SELF_TEST_OK count=3 title_override=ok unread_override=ok read_override=ok runtime_override=ok action_override=ok usage=ok unread_state=ok runtime_state=ok display_state=ok unread_update_count=1"* ]] || {
+[[ "$self_test_output" == *"SELF_TEST_OK count=3 title_override=ok unread_override=ok read_override=ok runtime_override=ok action_override=ok usage=ok unread_state=ok runtime_state=ok display_state=ok work_report=ok unread_update_count=1"* ]] || {
   print -u2 "固定测试库自检失败：$self_test_output"
   exit 3
 }
@@ -149,6 +171,15 @@ usage_test_output="$(
 [[ "$usage_test_output" == "USAGE_SELF_TEST_OK windows=2 analytics=ok" ]] || {
   print -u2 "Codex 用量协议自检失败：$usage_test_output"
   exit 9
+}
+
+report_test_output="$(
+  CODEX_REPORT_CODEX_OVERRIDE="$FIXTURE_REPORT_CODEX" \
+  "$BINARY" --report-self-test
+)"
+[[ "$report_test_output" == "REPORT_SELF_TEST_OK codex_summary=ok structured_output=ok redaction=ok progress=ok" ]] || {
+  print -u2 "Codex 智能报告自检失败：$report_test_output"
+  exit 14
 }
 
 set +e
@@ -217,4 +248,5 @@ fi
 
 print "$self_test_output"
 print "$usage_test_output"
+print "$report_test_output"
 print "QA_OK app=$APP_DIR"
