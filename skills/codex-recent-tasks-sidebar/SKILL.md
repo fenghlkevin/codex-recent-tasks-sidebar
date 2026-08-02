@@ -21,6 +21,9 @@ Build from the bundled template instead of recreating the app. Preserve its read
    - remaining usage, available reset windows, account plan, and expandable analytics appear; a usage failure leaves the task list usable;
    - opening the report window or switching its period never starts generation; an explicit Generate or Regenerate action switches between today and the current week, groups results by project, creates one concise sentence per task, and copies/exports Markdown;
    - left and right docking both work;
+   - entering a native Codex/ChatGPT full-screen Space hides the sidebar, and leaving full screen restores its previous docked or pinned mode;
+   - switching left or right between macOS Spaces hides the sidebar during the transition instead of flashing it onto the adjacent Space;
+   - moving the Codex/ChatGPT window across displays hides the sidebar until the destination display and frame settle, then docks once without intermediate cross-screen frames;
    - docked mode follows the Codex foreground/background layer;
    - pinned mode stays above other apps and remains draggable;
    - clicking a task activates Codex and opens its exact `codex://threads/{id}` deep link;

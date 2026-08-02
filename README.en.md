@@ -64,6 +64,9 @@ Opening the report window or switching between daily and weekly reports does not
 
 - Switch between Docked and Pinned in one segmented control. When docked, choose Left or Right.
 - Follows ChatGPT window movement, resizing, foreground changes, minimization, and restoration.
+- Hides the sidebar while ChatGPT occupies a native macOS full-screen Space, then restores the previous Docked or Pinned mode after full-screen exit.
+- Hides the sidebar during left/right macOS Space transitions on a single display, preventing it from flashing onto the adjacent desktop.
+- Hides the sidebar while the ChatGPT window crosses displays, then performs one final dock after the window settles on the destination display.
 - Falls back to the other side when the preferred side does not have enough room, avoiding overlap and unintended placement on another display.
 - Pinned mode remains independently movable and above other apps.
 - Offers Narrow, Medium, and Wide presets from the menu bar.
