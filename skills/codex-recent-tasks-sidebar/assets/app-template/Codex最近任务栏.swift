@@ -1787,12 +1787,11 @@ enum CodexWindowLocator {
     }
 
     static func isCodexFullScreen() -> Bool {
-        if let frame = largestWindowFrame(),
-           DockPlacement.isFullScreenFrame(
-               frame,
-               screenFrames: NSScreen.screens.map(\.frame)
-           ) {
-            return true
+        if let frame = largestWindowFrame() {
+            return DockPlacement.isFullScreenFrame(
+                frame,
+                screenFrames: NSScreen.screens.map(\.frame)
+            )
         }
 
         guard hasAccessibilityPermission(),
@@ -1803,19 +1802,26 @@ enum CodexWindowLocator {
         }
 
         let appElement = AXUIElementCreateApplication(codex.processIdentifier)
-        var windowsValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsValue) == .success,
-              let windows = windowsValue as? [AXUIElement] else {
+        var focusedWindowValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+                  appElement,
+                  kAXFocusedWindowAttribute as CFString,
+                  &focusedWindowValue
+              ) == .success,
+              let focusedWindowValue else {
             return false
         }
 
-        return windows.contains { window in
-            var fullScreenValue: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(window, "AXFullScreen" as CFString, &fullScreenValue) == .success else {
-                return false
-            }
-            return (fullScreenValue as? Bool) == true
+        let focusedWindow = focusedWindowValue as! AXUIElement
+        var fullScreenValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+                  focusedWindow,
+                  "AXFullScreen" as CFString,
+                  &fullScreenValue
+              ) == .success else {
+            return false
         }
+        return (fullScreenValue as? Bool) == true
     }
 
     static func largestWindowFrame() -> NSRect? {
@@ -4169,6 +4175,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             return
         }
+        if DockPlacement.isFullScreenFrame(
+            codexFrame,
+            screenFrames: NSScreen.screens.map(\.frame)
+        ) {
+            isCodexFullScreen = true
+            lastCodexFrameSample = nil
+            hidePanelForCodexFullScreen()
+            updateWindowStatus("Codex 全屏，任务栏已隐藏")
+            return
+        }
         trackCodexResizeInteraction(codexFrame)
         if shouldTreatAsCodexMiniaturizing(codexFrame) {
             miniaturizePanelUntilCodexWindowReturns()
@@ -4322,7 +4338,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func startFullScreenTracking() {
         fullScreenTimer?.invalidate()
-        let timer = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.refreshCodexFullScreenState()
             }
@@ -4348,17 +4364,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func hidePanelForCodexFullScreen() {
         guard let panel else { return }
+        let wasAlreadyHidden = isHiddenBecauseCodexFullScreen
         isHiddenBecauseCodexFullScreen = true
+        panel.collectionBehavior = []
         panel.alphaValue = 0
         panel.ignoresMouseEvents = false
         panel.level = .normal
         panel.orderOut(nil)
-        recordWindowLayerState("fullscreen-hidden")
+        if !wasAlreadyHidden {
+            recordWindowLayerState("fullscreen-hidden")
+        }
     }
 
     private func restorePanelAfterCodexFullScreen() {
         guard let panel, isHiddenBecauseCodexFullScreen else { return }
         isHiddenBecauseCodexFullScreen = false
+        panel.collectionBehavior = [.moveToActiveSpace]
         panel.alphaValue = 1
         panel.ignoresMouseEvents = false
 
@@ -4472,6 +4493,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let panel else { return }
         pendingSpaceRestore?.cancel()
         isHiddenBecauseSpaceTransition = true
+        panel.collectionBehavior = []
         panel.alphaValue = 0
         panel.level = .normal
         panel.orderOut(nil)
@@ -4483,6 +4505,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 guard let self else { return }
                 self.pendingSpaceRestore = nil
                 self.isHiddenBecauseSpaceTransition = false
+                self.panel?.collectionBehavior = [.moveToActiveSpace]
                 self.isCodexFullScreen = CodexWindowLocator.isCodexFullScreen()
                 if self.isCodexFullScreen {
                     self.hidePanelForCodexFullScreen()
