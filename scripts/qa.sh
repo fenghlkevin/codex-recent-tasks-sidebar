@@ -130,8 +130,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 prompt="$(/bin/cat)"
-[[ -n "$output_path" && "$prompt" == *"请完善权限模块并补充测试"* ]] || exit 31
-print -r -- '{"items":[{"key":"item-1","summary":"完成权限模块改造并补充固定测试。","completion_percent":100}],"overall_summary":"完成权限模块改造，相关固定测试已通过。","next_steps":"继续验证边界场景并整理交付说明。"}' > "$output_path"
+[[ -n "$output_path" && "$prompt" == *"请完善权限模块并补充测试"* && "$prompt" == *"报告风格：简洁"* ]] || exit 31
+print -r -- '{"items":[{"key":"item-1","summary":"完成权限模块改造并补充固定测试。","completion_percent":100}],"project_summaries":[{"key":"project-1","summary":"修复权限校验问题，并完善权限模块和固定测试。"}],"overall_summary":"完成权限模块改造，相关固定测试已通过。","next_steps":"继续验证边界场景并整理交付说明。"}' > "$output_path"
 ZSH
 chmod +x "$FIXTURE_REPORT_CODEX"
 

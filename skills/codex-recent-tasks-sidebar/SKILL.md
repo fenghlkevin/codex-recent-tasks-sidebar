@@ -19,7 +19,10 @@ Build from the bundled template instead of recreating the app. Preserve its read
    - renamed task notes from `session_index.jsonl` replace stale database titles on the next refresh;
    - status priority is “待操作 → 运行中 → 待查看 → time”: an active task never shows “待查看” early, a stopped unread task does, and opening it clears the label after refresh;
    - remaining usage, available reset windows, account plan, and expandable analytics appear; a usage failure leaves the task list usable;
-   - opening the report window or switching its period never starts generation; an explicit Generate or Regenerate action switches between today and the current week, groups results by project, creates one concise sentence per task, and copies/exports Markdown;
+   - opening the report window or switching its period or style never starts generation; an explicit Generate or Regenerate action creates per-task daily results or a concise multi-sentence summary per project for the current week, preserves explicit bug identifiers in weekly summaries, and copies/exports Markdown;
+   - report styles support concise, standard, and management-oriented output; generated results can be edited before copying, exporting, or saving to local history;
+   - project business aliases affect reports only, while exclusions are applied before report context is read; both settings are keyed by a project-path hash rather than a stored absolute path;
+   - report history stores only finalized report data, removes thread IDs, hashes project paths, retains at most 50 entries, and never stores raw conversation or tool-log context;
    - left and right docking both work;
    - entering a native Codex/ChatGPT full-screen Space hides the sidebar, and leaving full screen restores its previous docked or pinned mode;
    - switching left or right between macOS Spaces hides the sidebar during the transition instead of flashing it onto the adjacent Space;
@@ -39,7 +42,7 @@ The public template intentionally uses the generic bundle identifier `io.github.
 ## Safety boundaries
 
 - Treat the Codex SQLite database, rollout files, `session_index.jsonl`, and `.codex-global-state.json` as read-only. Never migrate, vacuum, replace, upload, or write to them.
-- Read user and assistant text only after an explicit report action. Minimize and redact it before an ephemeral Codex summary, keep generated results in memory for the visible report, and never include raw task text in diagnostics or QA output.
+- Read user and assistant text only after an explicit report action. Apply project exclusions first, minimize and redact remaining context before an ephemeral Codex summary, and never include raw task text in diagnostics or QA output. Persist only user-requested finalized report history after replacing thread IDs and project paths.
 - Fetch remaining usage only through the official `codex app-server` using the existing login state. Do not read, print, persist, or commit auth files, tokens, raw account responses, or reset timestamps.
 - Never commit a real `.sqlite` file, task title, thread ID, username path, API key, token, crash log, or local build cache.
 - Keep task selection keyed by the unique thread ID; titles are not unique identifiers.

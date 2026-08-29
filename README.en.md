@@ -20,13 +20,14 @@ It groups tasks from the last 48 hours by project directory and provides exact t
 
 > All three screenshots were generated from repository QA fixtures. They contain no real tasks, project paths, or account usage.
 
-## v1.5.1 highlights
+## v1.6.0 highlights
 
-- Adds Codex-generated daily and weekly reports with one-sentence outcomes, completion estimates, overall summaries, next-step suggestions, and Markdown export.
+- Expands Codex-generated reports: daily reports retain per-task outcomes and completion estimates, while weekly reports condense each project into a few sentences and preserve explicit bug identifiers.
+- Adds Concise, Standard, and Management report styles, editable results, local history, Markdown copying, and report export.
+- Adds business-facing project aliases and report exclusions. Settings use project-path hashes, and excluded projects never enter report context.
 - Opening the report window or switching its period never starts generation. Selected, redacted context is read only after an explicit Generate Report action.
 - Shows the current stage, estimated progress, and elapsed time while generating, with a local-summary fallback when Codex is unavailable.
-- Expands usage analytics, reset-time and account-plan presentation, diagnostics, and database retry handling.
-- Refines Docked/Pinned controls, left/right docking, project shortcuts, and window-width presets.
+- Fixes report-toolbar label wrapping in constrained space and strengthens report-history redaction and fixture validation.
 
 ## Features
 
@@ -53,10 +54,15 @@ The Terminal action uses the built-in macOS Terminal app and opens directly in t
 
 - Opens a separate Work Report window from the sidebar header or menu bar.
 - Filters tasks for today or the current week and groups them by project.
-- Uses the user's requests as primary evidence and assistant outcomes as supporting evidence, then asks Codex for a one-sentence result and completion estimate.
+- Uses the user's requests as primary evidence and assistant outcomes as supporting evidence. Daily reports produce a one-sentence result and completion estimate per task; weekly reports summarize bug fixes, resolved issues, new features, and other evidenced progress per project while preserving explicit bug identifiers from the source context.
 - Generates an overall summary and suggested next steps.
+- Offers Concise, Standard, and Management report styles before generation; changing styles never starts generation automatically.
+- Lets you edit per-task outcomes, project summaries, the overall summary, and next steps after generation.
+- Saves finalized reports to local history for reopening or deletion, with a maximum of 50 entries.
 - Shows the current stage, estimated percentage, and elapsed time while generating; it never displays 100% before the complete result arrives.
 - Copies Markdown or exports a `.md` file.
+
+The task context menu can also assign a business-facing project name for reports or exclude the project from daily and weekly reports. Aliases affect reports only. Exclusions are applied before report context is read.
 
 Opening the report window or switching between daily and weekly reports does not generate anything. Generation starts only after the user explicitly clicks Generate Report or Regenerate. The app trims user requests and assistant outcomes to the selected period, removes tool records, code blocks, absolute paths, and obvious secrets, then runs an ephemeral structured Codex summary. If Codex is unavailable, times out, or returns invalid output, the app falls back to its local summary.
 
@@ -77,7 +83,7 @@ Opening the report window or switching between daily and weekly reports does not
 - Preserves the official remaining-usage percentage.
 - Shows reset times for available rate-limit windows. If the official service omits the five-hour window, only the weekly window is shown.
 - Displays the account plan, including Plus, Pro, Pro Lite, and Pro Max.
-- Expands to a 30-day token chart, estimated equivalent API input cost, reset credits, and the most-used model.
+- Expands to a 30-day token chart, estimated equivalent API input cost, and reset credits.
 - Official daily usage can lag by one day. The UI shows the latest available date when today's bucket is unavailable.
 - Cost values are estimates based on official model input prices, not billing statements.
 
@@ -161,9 +167,10 @@ Privacy boundaries:
 - The normal task list never uploads task titles, task content, thread IDs, project paths, or event-stream payloads.
 - Only after the user explicitly clicks Generate Report or Regenerate are trimmed and redacted user requests and assistant outcomes sent to Codex through the current signed-in account. Thread IDs, absolute project paths, tool logs, and full code are excluded.
 - Smart reports use a temporary read-only directory and an ephemeral session, create no persistent Codex task, never write back to Codex data, and never log report input or raw model output.
+- Project report settings use a project-path hash as their key and do not persist absolute paths. Report history stores only finalized reports; thread IDs are removed and project paths are replaced with hashes before writing. Raw conversations and tool logs are never stored.
 - Never prints or persists login tokens or raw account responses.
 - Diagnostic logs contain candidate database paths, file status, SQLite error codes, and retry outcomes only. They do not contain task content.
-- `UserDefaults` stores only window placement, width, dock side, display mode, and usage-panel state.
+- `UserDefaults` stores window placement, width, dock side, display mode, usage-panel state, report style, and project report settings keyed by path hashes.
 - CI and QA use generated fixtures only.
 
 ## Refresh intervals
