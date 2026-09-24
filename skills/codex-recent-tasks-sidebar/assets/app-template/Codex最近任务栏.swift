@@ -1949,8 +1949,13 @@ enum DockSide: String {
 }
 
 enum DockPlacement {
-    static let gap: CGFloat = 8
-    static let trackingInterval: TimeInterval = 1.0 / 30.0
+    static let gap: CGFloat = 2
+    // Window drag events provide responsive tracking while the user is interacting.
+    // This timer is only a low-frequency safety net for programmatic window moves.
+    static let trackingInterval: TimeInterval = 1.0
+    static let trackingTimerTolerance: TimeInterval = 0.20
+    static let fullScreenTrackingInterval: TimeInterval = 1.0
+    static let fullScreenTimerTolerance: TimeInterval = 0.20
     static let movementTolerance: CGFloat = 0.5
     static let sizeTolerance: CGFloat = 0.5
     static let rapidShrinkDimensionDelta: CGFloat = 24
@@ -1965,11 +1970,20 @@ enum DockPlacement {
         maxPanelSize: NSSize,
         visibleFrame: NSRect
     ) -> NSSize {
-        let targetHeight = min(
-            max(minPanelSize.height, codexFrame.height),
-            min(maxPanelSize.height, visibleFrame.height)
-        )
-        return NSSize(width: currentPanelSize.width, height: targetHeight)
+        // Docked windows follow Codex even when its bottom extends offscreen.
+        return NSSize(width: currentPanelSize.width, height: codexFrame.height)
+    }
+
+    static func hasDockingSpace(codexFrame: NSRect, panelWidth: CGFloat, visibleFrame: NSRect) -> Bool {
+        let left = codexFrame.minX - gap - panelWidth
+        let right = codexFrame.maxX + gap
+        return (left >= visibleFrame.minX && left + panelWidth <= visibleFrame.maxX) ||
+            (right >= visibleFrame.minX && right + panelWidth <= visibleFrame.maxX)
+    }
+
+    static func isDockedForeground(_ bundleID: String?, ownBundleID: String?) -> Bool {
+        guard let bundleID else { return false }
+        return bundleID == "com.openai.codex" || bundleID == ownBundleID
     }
 
     static func targetOrigin(
@@ -2008,17 +2022,29 @@ enum DockPlacement {
             }
         }
 
-        let alignedTopY = codexFrame.maxY - panelSize.height
-        let targetY = min(
-            max(visibleFrame.minY, alignedTopY),
-            visibleFrame.maxY - panelSize.height
-        )
-        return NSPoint(x: targetX, y: targetY)
+        return NSPoint(x: targetX, y: codexFrame.maxY - panelSize.height)
     }
 
     static func dockingScreen(for codexFrame: NSRect, screens: [NSScreen]) -> NSScreen? {
         screens.max { lhs, rhs in
             lhs.frame.intersection(codexFrame).area < rhs.frame.intersection(codexFrame).area
+        }
+    }
+
+    // Native full-screen windows can stop below the camera housing on MacBooks.
+    // Use the hardware safe area, not visibleFrame (which also excludes the Dock).
+    static func fullScreenFrames(screenFrame: NSRect, safeAreaTop: CGFloat) -> [NSRect] {
+        guard safeAreaTop > 0, safeAreaTop < screenFrame.height else {
+            return [screenFrame]
+        }
+        var safeFrame = screenFrame
+        safeFrame.size.height -= safeAreaTop
+        return [screenFrame, safeFrame]
+    }
+
+    static var fullScreenFrames: [NSRect] {
+        NSScreen.screens.flatMap {
+            fullScreenFrames(screenFrame: $0.frame, safeAreaTop: $0.safeAreaInsets.top)
         }
     }
 
@@ -2180,7 +2206,7 @@ enum CodexWindowLocator {
             if let frame = windowFrame(focusedWindow) {
                 return DockPlacement.isFullScreenFrame(
                     frame,
-                    screenFrames: NSScreen.screens.map(\.frame)
+                    screenFrames: DockPlacement.fullScreenFrames
                 )
             }
         }
@@ -2188,7 +2214,7 @@ enum CodexWindowLocator {
         if let frame = largestWindowFrame() {
             return DockPlacement.isFullScreenFrame(
                 frame,
-                screenFrames: NSScreen.screens.map(\.frame)
+                screenFrames: DockPlacement.fullScreenFrames
             )
         }
         return false
@@ -2211,16 +2237,24 @@ enum CodexWindowLocator {
         }
 
         let appElement = AXUIElementCreateApplication(codex.processIdentifier)
-        var focusedWindowValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-                  appElement,
-                  kAXFocusedWindowAttribute as CFString,
-                  &focusedWindowValue
-              ) == .success,
-              let focusedWindowValue else {
-            return nil
+        // Focus can temporarily be absent during activation or Stage Manager changes.
+        // The main window is still usable and must not be treated as minimized.
+        for attribute in [kAXFocusedWindowAttribute, kAXMainWindowAttribute] {
+            var value: CFTypeRef?
+            if AXUIElementCopyAttributeValue(appElement, attribute as CFString, &value) == .success,
+               let value, CFGetTypeID(value) == AXUIElementGetTypeID() {
+                let window = value as! AXUIElement
+                if windowFrame(window) != nil { return window }
+            }
         }
-        return (focusedWindowValue as! AXUIElement)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
+              let windows = value as? [AXUIElement] else { return nil }
+        return windows.first { window in
+            var minimized: CFTypeRef?
+            let result = AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute as CFString, &minimized)
+            return result == .success && (minimized as? Bool) == false && windowFrame(window) != nil
+        }
     }
 
     private static func windowFrame(_ window: AXUIElement) -> NSRect? {
@@ -2324,11 +2358,13 @@ final class TaskStore: ObservableObject {
                 self?.refresh()
             }
         }
+        refreshTimer?.tolerance = 5
         runtimeRefreshTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.refreshRuntimeStates()
             }
         }
+        runtimeRefreshTimer?.tolerance = 1
     }
 
     deinit {
@@ -2999,6 +3035,7 @@ final class UsageStore: ObservableObject {
                 self?.refresh()
             }
         }
+        refreshTimer?.tolerance = 10
     }
 
     deinit {
@@ -4722,12 +4759,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statusItem: NSStatusItem?
     private var dockTimer: Timer?
     private var fullScreenTimer: Timer?
+    private var globalDragMonitor: Any?
     private var pendingSpaceRestore: DispatchWorkItem?
     private var isApplyingDockPosition = false
     private var isMiniaturizedBecauseCodexWindowMissing = false
     private var isHiddenBecauseCodexFullScreen = false
     private var isHiddenBecauseSpaceTransition = false
     private var isHiddenBecauseDisplayTransition = false
+    private var isHiddenBecauseInsufficientSpace = false
     private var isCodexFullScreen = false
     private var lastCodexFrameSample: (frame: NSRect, date: Date)?
     private var suppressMiniaturizationHeuristicUntil = Date.distantPast
@@ -4775,6 +4814,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         isCodexFullScreen = CodexWindowLocator.isCodexFullScreen()
+        startWindowInteractionTracking()
         startFullScreenTracking()
         applyWindowMode(.docked)
         if CodexWindowLocator.currentWindowFrame() != nil {
@@ -4795,6 +4835,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+        if let globalDragMonitor {
+            NSEvent.removeMonitor(globalDragMonitor)
+        }
         fullScreenTimer?.invalidate()
         pendingSpaceRestore?.cancel()
         usageStore.stop()
@@ -4875,6 +4918,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     self?.dockToCodexWindow()
                 }
             }
+            timer.tolerance = DockPlacement.trackingTimerTolerance
             RunLoop.main.add(timer, forMode: .common)
             dockTimer = timer
             if isHiddenBecauseSpaceTransition {
@@ -4890,6 +4934,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             panel.ignoresMouseEvents = false
             dockToCodexWindow()
         case .pinned:
+            isHiddenBecauseInsufficientSpace = false
             isMiniaturizedBecauseCodexWindowMissing = false
             isHiddenBecauseDisplayTransition = false
             lastDisplayTransitionFrameSample = nil
@@ -4938,10 +4983,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         guard let codexFrame = CodexWindowLocator.currentWindowFrame() else {
+            UserDefaults.standard.set(CodexWindowLocator.hasAccessibilityPermission(), forKey: "SidebarAccessibilityTrusted")
+            UserDefaults.standard.set(NSScreen.screens.count, forKey: "SidebarScreenCount")
             if CodexWindowLocator.isCodexRunning() {
                 lastCodexFrameSample = nil
                 miniaturizePanelUntilCodexWindowReturns()
-                updateWindowStatus("Codex 已最小化")
+                recordWindowLayerState("window-unavailable")
+                updateWindowStatus(CodexWindowLocator.hasAccessibilityPermission()
+                    ? "暂未获取到 Codex 窗口，正在重试"
+                    : "请授权辅助功能以跟随 Codex 窗口")
             } else {
                 terminateBecauseCodexExited()
             }
@@ -4949,7 +4999,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         if DockPlacement.isFullScreenFrame(
             codexFrame,
-            screenFrames: NSScreen.screens.map(\.frame)
+            screenFrames: DockPlacement.fullScreenFrames
         ) {
             isCodexFullScreen = true
             lastCodexFrameSample = nil
@@ -4980,6 +5030,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             maxPanelSize: panel.maxSize,
             visibleFrame: visibleFrame
         )
+        isHiddenBecauseInsufficientSpace = !DockPlacement.hasDockingSpace(
+            codexFrame: codexFrame,
+            panelWidth: targetPanelSize.width,
+            visibleFrame: visibleFrame
+        )
+        guard !isHiddenBecauseInsufficientSpace else {
+            panel.orderOut(nil)
+            recordWindowLayerState("insufficient-space-hidden")
+            updateWindowStatus("两侧空间不足，任务栏已隐藏")
+            return
+        }
         let targetOrigin = DockPlacement.targetOrigin(
             codexFrame: codexFrame,
             panelSize: targetPanelSize,
@@ -5104,24 +5165,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         displayTransitionHiddenSince = nil
         panel.alphaValue = 1
         panel.ignoresMouseEvents = false
-        panel.level = .floating
-        panel.orderFrontRegardless()
+        updateDockedWindowLevel()
     }
 
     private func startFullScreenTracking() {
         fullScreenTimer?.invalidate()
-        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: DockPlacement.fullScreenTrackingInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.refreshCodexFullScreenState()
             }
         }
+        timer.tolerance = DockPlacement.fullScreenTimerTolerance
         RunLoop.main.add(timer, forMode: .common)
         fullScreenTimer = timer
     }
 
+    private func startWindowInteractionTracking() {
+        guard globalDragMonitor == nil else { return }
+        globalDragMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged]) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.windowMode.mode == .docked else { return }
+                self.dockToCodexWindow()
+            }
+        }
+    }
+
     private func refreshCodexFullScreenState() {
         let fullScreen = CodexWindowLocator.isCodexFullScreen()
-        guard fullScreen != isCodexFullScreen else { return }
+        let diagnostics: [String: Any] = [
+            "time": Date().timeIntervalSince1970,
+            "trusted": CodexWindowLocator.hasAccessibilityPermission(),
+            "detectedFullScreen": fullScreen,
+            "storedFullScreen": isCodexFullScreen,
+            "hiddenFullScreen": isHiddenBecauseCodexFullScreen,
+            "hiddenSpace": isHiddenBecauseSpaceTransition,
+            "hiddenDisplay": isHiddenBecauseDisplayTransition,
+            "missingWindow": isMiniaturizedBecauseCodexWindowMissing,
+            "insufficientSpace": isHiddenBecauseInsufficientSpace,
+            "visible": panel?.isVisible ?? false
+        ]
+        UserDefaults.standard.set(diagnostics, forKey: "SidebarWindowDiagnostics")
+        // Space notifications can update the observed state before the timer fires.
+        // Reconcile a pending hide even when the observed full-screen value is unchanged.
+        guard fullScreen != isCodexFullScreen || (!fullScreen && isHiddenBecauseCodexFullScreen) else { return }
         isCodexFullScreen = fullScreen
 
         if fullScreen {
@@ -5205,8 +5291,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         isMiniaturizedBecauseCodexWindowMissing = false
         panel.alphaValue = 1
         panel.ignoresMouseEvents = false
-        panel.level = .floating
-        panel.orderFrontRegardless()
+        updateDockedWindowLevel()
     }
 
     func windowDidMove(_ notification: Notification) {
@@ -5258,7 +5343,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func workspaceApplicationDidActivate(_ notification: Notification) {
+        guard windowMode.mode == .docked else { return }
         updateDockedWindowLevel()
+        dockToCodexWindow()
     }
 
     @objc private func workspaceActiveSpaceDidChange(_ notification: Notification) {
@@ -5278,7 +5365,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self.pendingSpaceRestore = nil
                 self.isHiddenBecauseSpaceTransition = false
                 self.panel?.collectionBehavior = [.moveToActiveSpace]
-                self.isCodexFullScreen = CodexWindowLocator.isCodexFullScreen()
+                self.refreshCodexFullScreenState()
                 if self.isCodexFullScreen {
                     self.hidePanelForCodexFullScreen()
                     self.updateWindowStatus("Codex 全屏，任务栏已隐藏")
@@ -5310,7 +5397,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard windowMode.mode == .docked, let panel else { return }
         let frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let ownBundleID = Bundle.main.bundleIdentifier
-        let shouldBeFront = frontmostBundleID == "com.openai.codex" || frontmostBundleID == ownBundleID
+        let shouldBeFront = DockPlacement.isDockedForeground(frontmostBundleID, ownBundleID: ownBundleID)
 
         guard !isHiddenBecauseCodexFullScreen else {
             recordWindowLayerState("fullscreen-hidden", frontmostBundleID: frontmostBundleID)
@@ -5332,6 +5419,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
 
+        guard !isHiddenBecauseInsufficientSpace else {
+            panel.orderOut(nil)
+            recordWindowLayerState("insufficient-space-hidden", frontmostBundleID: frontmostBundleID)
+            return
+        }
+
         if shouldBeFront {
             let needsOrdering = panel.level != .floating ||
                 !panel.isVisible ||
@@ -5342,9 +5435,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if needsOrdering {
                 panel.orderFrontRegardless()
             }
-        } else if panel.level != .normal {
+        } else {
             panel.level = .normal
-            panel.orderBack(nil)
+            panel.orderOut(nil)
         }
 
         let foregroundState: String
@@ -5353,9 +5446,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } else if frontmostBundleID == ownBundleID {
             foregroundState = "正在操作"
         } else {
-            foregroundState = "已随 Codex 后置"
+            foregroundState = "Codex 在后台，任务栏已隐藏"
         }
-        recordWindowLayerState(shouldBeFront ? "front" : "back", frontmostBundleID: frontmostBundleID)
+        recordWindowLayerState(shouldBeFront ? "front" : "background-hidden", frontmostBundleID: frontmostBundleID)
         updateWindowStatus("已吸附 \(windowMode.dockSide.label) · \(foregroundState)")
     }
 
@@ -5435,11 +5528,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             hidePanelForCodexFullScreen()
             return
         }
+        NSApp.activate(ignoringOtherApps: true)
         if windowMode.mode == .docked {
             dockToCodexWindow()
+        } else {
+            panel.orderFrontRegardless()
         }
-        panel.orderFrontRegardless()
-        NSApp.activate(ignoringOtherApps: true)
     }
 
     @objc private func showReport() {
@@ -5471,7 +5565,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if !isHiddenBecauseSpaceTransition,
            !isHiddenBecauseDisplayTransition,
            !isCodexFullScreen {
-            panel?.orderFrontRegardless()
+            restorePanelForCurrentMode()
         }
     }
 
@@ -5594,6 +5688,22 @@ enum SelfTest {
                 fputs("SELF_TEST_FAILED dock side placement\n", stderr)
                 return 6
             }
+            let loweredWindow = NSRect(x: 400, y: -250, width: 1000, height: 1000)
+            let loweredSize = DockPlacement.targetPanelSize(
+                codexFrame: loweredWindow, currentPanelSize: panelSize,
+                minPanelSize: NSSize(width: 300, height: 420),
+                maxPanelSize: NSSize(width: 560, height: 1200), visibleFrame: visibleFrame
+            )
+            let loweredOrigin = DockPlacement.targetOrigin(
+                codexFrame: loweredWindow, panelSize: loweredSize,
+                visibleFrame: visibleFrame, side: .left
+            )
+            guard loweredSize.height == loweredWindow.height,
+                  loweredOrigin.y == loweredWindow.minY,
+                  loweredOrigin.y + loweredSize.height == loweredWindow.maxY else {
+                fputs("SELF_TEST_FAILED docked top alignment near screen bottom\n", stderr)
+                return 6
+            }
             let crampedLeftFrame = NSRect(x: 120, y: 100, width: 900, height: 800)
             let crampedLeftOrigin = DockPlacement.targetOrigin(
                 codexFrame: crampedLeftFrame,
@@ -5617,6 +5727,18 @@ enum SelfTest {
                 fputs("SELF_TEST_FAILED dock side fallback crosses screen\n", stderr)
                 return 6
             }
+            guard DockPlacement.hasDockingSpace(codexFrame: codexFrame, panelWidth: 320, visibleFrame: visibleFrame),
+                  !DockPlacement.hasDockingSpace(
+                      codexFrame: NSRect(x: 100, y: 100, width: 1600, height: 800),
+                      panelWidth: 320, visibleFrame: visibleFrame
+                  ),
+                  DockPlacement.isDockedForeground("com.openai.codex", ownBundleID: "test.sidebar"),
+                  DockPlacement.isDockedForeground("test.sidebar", ownBundleID: "test.sidebar"),
+                  !DockPlacement.isDockedForeground("test.other", ownBundleID: "test.sidebar"),
+                  !DockPlacement.isDockedForeground(nil, ownBundleID: nil) else {
+                fputs("SELF_TEST_FAILED docked visibility policy\n", stderr)
+                return 6
+            }
             let fullScreenFrame = NSRect(x: 0, y: 0, width: 1800, height: 1000)
             let maximizedFrame = NSRect(x: 0, y: 25, width: 1800, height: 975)
             guard DockPlacement.isFullScreenFrame(
@@ -5628,6 +5750,28 @@ enum SelfTest {
                       screenFrames: [visibleFrame]
                   ) else {
                 fputs("SELF_TEST_FAILED full screen visibility policy\n", stderr)
+                return 6
+            }
+            let laptopScreen = NSRect(x: -1512, y: 200, width: 1512, height: 982)
+            let laptopFullScreen = NSRect(x: -1512, y: 200, width: 1512, height: 950)
+            let laptopCandidates = DockPlacement.fullScreenFrames(
+                screenFrame: laptopScreen, safeAreaTop: 32
+            )
+            guard DockPlacement.isFullScreenFrame(laptopScreen, screenFrames: laptopCandidates),
+                  DockPlacement.isFullScreenFrame(laptopFullScreen, screenFrames: laptopCandidates),
+                  !DockPlacement.isFullScreenFrame(
+                      NSRect(x: -1512, y: 250, width: 1512, height: 900),
+                      screenFrames: laptopCandidates
+                  ),
+                  !DockPlacement.isFullScreenFrame(
+                      NSRect(x: -1512, y: 200, width: 756, height: 950),
+                      screenFrames: laptopCandidates
+                  ),
+                  !DockPlacement.isFullScreenFrame(
+                      laptopFullScreen,
+                      screenFrames: DockPlacement.fullScreenFrames(screenFrame: laptopScreen, safeAreaTop: 0)
+                  ) else {
+                fputs("SELF_TEST_FAILED laptop safe-area full screen policy\n", stderr)
                 return 6
             }
             let secondScreenFrame = NSRect(x: 1800, y: 0, width: 1200, height: 1000)
