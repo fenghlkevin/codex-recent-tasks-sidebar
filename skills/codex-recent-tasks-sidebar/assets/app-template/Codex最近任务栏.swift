@@ -1363,7 +1363,9 @@ private enum CodexReportSummarizer {
         }
         let home = fileManager.homeDirectoryForCurrentUser.path
         let candidates = [
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
             "/Applications/ChatGPT.app/Contents/Resources/codex",
+            "/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex",
             "/Applications/Codex.app/Contents/Resources/codex",
             "\(home)/.npm-global/bin/codex",
             "/opt/homebrew/bin/codex",
@@ -3007,7 +3009,9 @@ final class CodexUsageClient {
         }
 
         let candidates = [
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
             "/Applications/ChatGPT.app/Contents/Resources/codex",
+            "/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex",
             "/Applications/Codex.app/Contents/Resources/codex",
             "/opt/homebrew/bin/codex",
             "/usr/local/bin/codex",
